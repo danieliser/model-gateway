@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "model-gateway"
+version = "0.1.0"
+description = "Local model gateway with routing and backend management"
+requires-python = ">=3.11"
+dependencies = [
+    "litellm",
+    "click",
+    "pyyaml",
+    "uvicorn",
+    "fastapi",
+    "httpx",
+]
+
+[project.scripts]
+gateway = "model_gateway.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/model_gateway"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]

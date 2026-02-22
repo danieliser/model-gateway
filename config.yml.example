@@ -1,0 +1,51 @@
+port: 8800
+default_model: qwen3-4b
+
+models:
+  qwen3-4b:
+    backend: mlx
+    model_id: mlx-community/Qwen3-4B-Instruct-4bit
+  qwen3-8b:
+    backend: mlx
+    model_id: mlx-community/Qwen3-8B-Instruct-4bit
+  haiku:
+    backend: anthropic
+    model_id: claude-haiku-4-5-20251001
+    api_key_env: ANTHROPIC_API_KEY
+  sonnet:
+    backend: anthropic
+    model_id: claude-sonnet-4-6
+    api_key_env: ANTHROPIC_API_KEY
+  gpt-4o:
+    backend: openai
+    model_id: gpt-4o
+    api_key_env: OPENAI_API_KEY
+
+backends:
+  mlx:
+    enabled: true
+  llama-cpp:
+    enabled: true
+    binary: llama-server
+  ollama:
+    enabled: false
+    host: http://localhost:11434
+  anthropic:
+    enabled: true
+    api_key_env: ANTHROPIC_API_KEY
+  openai:
+    enabled: true
+    api_key_env: OPENAI_API_KEY
+
+task_routing:
+  extraction: qwen3-4b
+  classification: qwen3-4b
+  coding: sonnet
+  reasoning: opus
+  general: haiku
+
+fallback_chain:
+  - mlx
+  - llama-cpp
+  - ollama
+  - haiku
