@@ -64,6 +64,9 @@ async def shutdown() -> None:
 
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
+    if not _config or not _backend_manager or not _proxy_manager or not _task_router:
+        raise HTTPException(503, "Gateway not initialized yet")
+
     body = await request.json()
     model = body.get("model", _config.default_model)
     messages = body.get("messages", [])
@@ -220,7 +223,7 @@ def ensure_gateway_running(port: int = 8800, timeout: float = 30.0) -> str:
 
     # 2. Start gateway as daemon
     subprocess.Popen(
-        ["gateway", "serve", "--port", str(port)],
+        ["gateway", "start", "--foreground", "--port", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,

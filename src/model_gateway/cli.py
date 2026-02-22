@@ -302,7 +302,7 @@ def switch(ctx, alias):
         click.secho(str(e), fg="red", err=True)
         raise SystemExit(1)
 
-    result = _gateway_request("POST", "/gateway/switch", port=config.port, json={"alias": alias})
+    result = _gateway_request("POST", "/gateway/switch", port=config.port, json={"model": alias})
     if result is None:
         click.secho(
             "Gateway not running. Run 'gateway start' first.", fg="red", err=True
