@@ -13,23 +13,17 @@ from dataclasses import dataclass
 
 import httpx
 
-from model_gateway.config import BackendConfig, GatewayConfig, ModelConfig, get_log_dir
+from model_gateway.config import CLOUD_BACKENDS, BackendConfig, GatewayConfig, ModelConfig, get_log_dir
 
 logger = logging.getLogger(__name__)
-
-_CLOUD_BACKENDS = {"anthropic", "openai"}
 _EXTERNAL_BACKENDS = {"ollama", "lm_studio", "lm-studio"}
 
 
 def _is_mlx_available() -> bool:
-    """Check macOS + arm64 + mlx_lm importable."""
+    """Check macOS + arm64 + vllm-mlx binary available."""
     if sys.platform != "darwin" or platform.machine() != "arm64":
         return False
-    try:
-        import importlib.util
-        return importlib.util.find_spec("mlx_lm") is not None
-    except Exception:
-        return False
+    return shutil.which("vllm-mlx") is not None
 
 
 def _is_binary_available(name: str) -> bool:
@@ -104,9 +98,9 @@ class BackendManager:
                 self._status_errors[backend_name] = f"Model '{model_id}' not downloaded"
                 return None
             return [
-                sys.executable, "-m", "mlx_lm", "server",
-                "--model", model_id,
+                "vllm-mlx", "serve", model_id,
                 "--port", str(port),
+                "--continuous-batching",
             ]
         elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
             model_path = model_cfg.model_path or model_cfg.model_id
@@ -120,7 +114,7 @@ class BackendManager:
     def _health_url(self, backend_name: str, port: int | None, backend_cfg: BackendConfig | None) -> str:
         """Return the health check URL for a backend."""
         if backend_name == "mlx":
-            return f"http://localhost:{port}/v1/models"
+            return f"http://localhost:{port}/health"
         elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
             return f"http://localhost:{port}/health"
         elif backend_name == "ollama":
@@ -155,7 +149,7 @@ class BackendManager:
             return False
 
         # External / cloud backends don't need subprocess
-        if backend_name in _CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
+        if backend_name in CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
             return True
 
         cmd = self._build_command(backend_name, model_cfg, self._alloc_port())
@@ -278,7 +272,7 @@ class BackendManager:
         backend_cfg = self._get_backend_cfg(backend_name)
 
         # Cloud backends: check env var
-        if backend_name in _CLOUD_BACKENDS:
+        if backend_name in CLOUD_BACKENDS:
             if backend_cfg and backend_cfg.api_key_env:
                 return os.environ.get(backend_cfg.api_key_env) is not None
             return False

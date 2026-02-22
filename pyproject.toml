@@ -14,10 +14,12 @@ dependencies = [
     "uvicorn",
     "fastapi",
     "httpx",
+    "vllm-mlx>=0.2.1",
 ]
 
 [project.scripts]
-gateway = "model_gateway.cli:cli"
+model-gateway = "model_gateway.fast_cli:main"
+model-gateway-full = "model_gateway.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/model_gateway"]

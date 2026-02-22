@@ -3,14 +3,13 @@
 import logging
 from typing import Any, AsyncGenerator
 
+import httpx
 import litellm
 from litellm import Router
 
-from model_gateway.config import GatewayConfig
+from model_gateway.config import CLOUD_BACKENDS, GatewayConfig
 
 logger = logging.getLogger(__name__)
-
-_CLOUD_BACKENDS = {"anthropic", "openai"}
 
 
 class ProxyManager:
@@ -18,6 +17,7 @@ class ProxyManager:
         self._config = config
         self._backend_urls: dict[str, str] = {}
         self._router: Router | None = None
+        self._http_client: httpx.AsyncClient | None = None
 
     def setup(self, backend_ports: dict[str, int]) -> None:
         """Configure LiteLLM Router with model aliases from our config."""
@@ -34,6 +34,10 @@ class ProxyManager:
             self._router = Router(model_list=model_list)
         else:
             logger.warning("No models configured for LiteLLM Router")
+
+        # Shared httpx client for local pass-through (connection pooling)
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=120.0)
 
     def _build_model_entry(self, alias: str, model_cfg: Any) -> dict | None:
         """Build a single LiteLLM model_list entry."""
@@ -91,6 +95,16 @@ class ProxyManager:
         # Re-setup router with updated URLs
         self.setup({backend_name: port})
 
+    def _is_local_model(self, model: str) -> tuple[bool, str | None]:
+        """Check if model routes to a local backend. Returns (is_local, api_base)."""
+        model_cfg = self._config.models.get(model)
+        if model_cfg is None:
+            return False, None
+        if model_cfg.backend in CLOUD_BACKENDS:
+            return False, None
+        api_base = self._backend_urls.get(model_cfg.backend)
+        return api_base is not None, api_base
+
     async def completion(
         self,
         model: str,
@@ -98,7 +112,15 @@ class ProxyManager:
         stream: bool = False,
         **kwargs: Any,
     ) -> Any:
-        """Route a chat completion through LiteLLM Router."""
+        """Route a chat completion — pass-through for local, LiteLLM for cloud."""
+        is_local, api_base = self._is_local_model(model)
+
+        if is_local and api_base and self._http_client:
+            return await self._local_passthrough(
+                model, api_base, messages, stream, **kwargs,
+            )
+
+        # Cloud backends go through LiteLLM Router
         if self._router is None:
             raise RuntimeError("ProxyManager not initialized — call setup() first")
 
@@ -110,6 +132,36 @@ class ProxyManager:
         )
         return response
 
+    async def _local_passthrough(
+        self,
+        model: str,
+        api_base: str,
+        messages: list[dict],
+        stream: bool,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Bypass LiteLLM — raw httpx proxy to local backend."""
+        model_cfg = self._config.models[model]
+        url = f"{api_base}/chat/completions"
+        payload: dict[str, Any] = {
+            "model": model_cfg.model_id or model,
+            "messages": messages,
+            "stream": stream,
+        }
+        payload.update(kwargs)
+
+        if stream:
+            req = self._http_client.build_request("POST", url, json=payload)
+            return await self._http_client.send(req, stream=True)
+        else:
+            return await self._http_client.post(url, json=payload)
+
+    async def close(self) -> None:
+        """Close the httpx client."""
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
     def get_available_models(self) -> list[dict]:
         """Return list of configured models with their backend info."""
         result = []
@@ -120,7 +172,7 @@ class ProxyManager:
                 "backend": backend,
                 "model_id": model_cfg.model_id,
             }
-            if backend not in _CLOUD_BACKENDS:
+            if backend not in CLOUD_BACKENDS:
                 info["api_base"] = self._backend_urls.get(backend)
             result.append(info)
         return result

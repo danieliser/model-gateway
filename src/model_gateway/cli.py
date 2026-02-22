@@ -7,15 +7,16 @@ import sys
 import time
 
 import click
+import httpx
 
 from model_gateway.config import (
+    CLOUD_BACKENDS,
     get_config_dir,
     get_log_dir,
     get_pid_file,
     load_config,
     validate_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,8 +36,6 @@ def _is_process_running(pid: int) -> bool:
 
 def _wait_for_health(port: int, timeout: float = 15.0) -> bool:
     """Poll gateway /health endpoint until it responds or timeout."""
-    import httpx
-
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -51,8 +50,6 @@ def _wait_for_health(port: int, timeout: float = 15.0) -> bool:
 
 def _gateway_request(method: str, path: str, port: int = 8800, **kwargs):
     """Make HTTP request to running gateway. Returns None if gateway not running."""
-    import httpx
-
     url = f"http://localhost:{port}{path}"
     try:
         resp = httpx.request(method, url, timeout=5.0, **kwargs)
@@ -62,6 +59,45 @@ def _gateway_request(method: str, path: str, port: int = 8800, **kwargs):
         return None
     except Exception:
         return None
+
+
+def _resolve_api_base(config, model_alias: str) -> tuple[str, str]:
+    """Resolve model alias to (api_base, model_to_send).
+
+    Local backends → direct to backend port (skip gateway, minimal hops).
+    Cloud backends → through gateway (handles auth + LiteLLM routing).
+    """
+    model_cfg = config.models.get(model_alias)
+    if model_cfg is None:
+        available = sorted(config.models.keys())
+        raise click.ClickException(
+            f"Unknown model '{model_alias}'. Available: {', '.join(available)}"
+        )
+
+    if model_cfg.backend in CLOUD_BACKENDS:
+        return f"http://localhost:{config.port}/v1", model_alias
+
+    # Local backend — go direct
+    model_id = model_cfg.model_id or model_alias
+    return "http://localhost:8801/v1", model_id
+
+
+def _get_prompt_or_stdin(prompt: str | None) -> str:
+    """Get prompt from argument or stdin."""
+    if prompt:
+        return prompt
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    raise click.ClickException("No prompt provided. Pass as argument or pipe via stdin.")
+
+
+def _default_model(config) -> str:
+    """Return the default model alias from config."""
+    if config.default_model:
+        return config.default_model
+    if config.models:
+        return next(iter(config.models))
+    raise click.ClickException("No models configured.")
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +112,208 @@ def cli(ctx, quiet):
     """Model Gateway — manage local AI model routing and backends."""
     ctx.ensure_object(dict)
     ctx.obj["quiet"] = quiet
+
+
+# ---------------------------------------------------------------------------
+# Query commands
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("prompt", required=False)
+@click.option("--model", "-m", default=None, help="Model alias from config.")
+@click.option("--system", "-s", default=None, help="System prompt.")
+@click.option("--max-tokens", default=None, type=int, help="Max tokens to generate.")
+@click.option("--stream/--no-stream", default=True, help="Stream output (default: on).")
+@click.option("--json", "json_output", is_flag=True, help="Output raw JSON response.")
+def chat(prompt, model, system, max_tokens, stream, json_output):
+    """Send a chat completion (tries worker, then direct, then gateway).
+
+    \b
+    Examples:
+      model-gateway chat "Say hello" -m qwen3-4b
+      model-gateway chat --system "Be terse" "What is 2+2?"
+      echo "Explain gravity" | model-gateway chat -m qwen3-4b
+    """
+    config = _load_config_or_exit()
+    model = model or _default_model(config)
+    prompt_text = _get_prompt_or_stdin(prompt)
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt_text})
+
+    # Try 1: persistent worker (fastest — warm pool, no startup)
+    if _try_worker_chat(model, messages, stream, max_tokens, json_output):
+        return
+
+    # Try 2: direct httpx (local) or gateway (cloud)
+    api_base, model_id = _resolve_api_base(config, model)
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "stream": stream,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    url = f"{api_base}/chat/completions"
+    start_ts = time.perf_counter()
+
+    try:
+        if stream and not json_output:
+            _stream_chat(url, payload)
+        else:
+            resp = httpx.post(url, json=payload, timeout=120.0)
+            resp.raise_for_status()
+            data = resp.json()
+            if json_output:
+                import json as _json
+                click.echo(_json.dumps(data, indent=2))
+            else:
+                content = data["choices"][0]["message"]["content"]
+                click.echo(content)
+    except httpx.ConnectError:
+        raise click.ClickException("Cannot connect. Is the backend or gateway running?")
+    except Exception as e:
+        raise click.ClickException(f"Request failed: {e}")
+
+    latency = (time.perf_counter() - start_ts) * 1000
+    click.echo(f"\n({latency:.0f}ms)", err=True)
+
+
+def _stream_chat(url: str, payload: dict) -> None:
+    """Stream SSE chat response, printing tokens as they arrive."""
+    import httpx
+    import json as _json
+
+    with httpx.stream("POST", url, json=payload, timeout=120.0) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                chunk = _json.loads(data_str)
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    click.echo(content, nl=False)
+            except _json.JSONDecodeError:
+                pass
+    click.echo()  # final newline
+
+
+@cli.command()
+@click.argument("text", required=False)
+@click.option("--model", "-m", default=None, help="Model alias from config.")
+@click.option("--file", "-f", "input_file", type=click.Path(exists=True), help="Read text from file.")
+def embed(text, model, input_file):
+    """Generate embeddings (tries worker, then direct, then gateway).
+
+    \b
+    Examples:
+      model-gateway embed "Hello world" -m qwen3-4b
+      model-gateway embed --file document.txt -m qwen3-4b
+    """
+    import json as _json
+
+    config = _load_config_or_exit()
+    model = model or _default_model(config)
+
+    if input_file:
+        with open(input_file) as f:
+            text = f.read().strip()
+    elif text is None:
+        if not sys.stdin.isatty():
+            text = sys.stdin.read().strip()
+        else:
+            raise click.ClickException("No text provided. Pass as argument, --file, or pipe via stdin.")
+
+    # Try 1: persistent worker
+    if _try_worker_embed(model, text):
+        return
+
+    # Try 2: direct httpx
+    api_base, model_id = _resolve_api_base(config, model)
+    url = f"{api_base}/embeddings"
+
+    start_ts = time.perf_counter()
+    try:
+        resp = httpx.post(url, json={"model": model_id, "input": text}, timeout=120.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.ConnectError:
+        raise click.ClickException("Cannot connect. Is the backend or gateway running?")
+    except Exception as e:
+        raise click.ClickException(f"Request failed: {e}")
+
+    latency = (time.perf_counter() - start_ts) * 1000
+
+    embeddings = data.get("data", [])
+    if embeddings:
+        vec = embeddings[0].get("embedding", [])
+        click.echo(f"Dimensions: {len(vec)}")
+        preview = ", ".join(f"{v:.6f}" for v in vec[:5])
+        click.echo(f"Preview:    [{preview}, ...]")
+        click.echo(_json.dumps(data), err=True)
+    else:
+        click.echo(_json.dumps(data, indent=2))
+
+    click.echo(f"({latency:.0f}ms)", err=True)
+
+
+@cli.command()
+@click.argument("prompt", required=False)
+@click.option("--model", "-m", default=None, help="Model alias from config.")
+@click.option("--max-tokens", default=100, type=int, help="Max tokens to generate.")
+def complete(prompt, model, max_tokens):
+    """Send a text completion (tries worker, then direct, then gateway).
+
+    \b
+    Examples:
+      model-gateway complete "Once upon a time" -m qwen3-4b
+      model-gateway complete "The meaning of life is" --max-tokens 50
+    """
+    config = _load_config_or_exit()
+    model = model or _default_model(config)
+    prompt_text = _get_prompt_or_stdin(prompt)
+
+    # Try 1: persistent worker
+    if _try_worker_complete(model, prompt_text, max_tokens):
+        return
+
+    # Try 2: direct httpx
+    api_base, model_id = _resolve_api_base(config, model)
+    url = f"{api_base}/completions"
+    payload = {
+        "model": model_id,
+        "prompt": prompt_text,
+        "max_tokens": max_tokens,
+    }
+
+    start_ts = time.perf_counter()
+    try:
+        resp = httpx.post(url, json=payload, timeout=120.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.ConnectError:
+        raise click.ClickException("Cannot connect. Is the backend or gateway running?")
+    except Exception as e:
+        raise click.ClickException(f"Request failed: {e}")
+
+    latency = (time.perf_counter() - start_ts) * 1000
+
+    choices = data.get("choices", [])
+    if choices:
+        click.echo(choices[0].get("text", ""))
+    else:
+        import json as _json
+        click.echo(_json.dumps(data, indent=2))
+
+    click.echo(f"\n({latency:.0f}ms)", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +394,7 @@ def stop(ctx):
 
     pid_file = get_pid_file()
     if not pid_file.exists():
-        click.echo("Gateway is not running. Run 'gateway start' first.")
+        click.echo("Gateway is not running. Run 'model-gateway start' first.")
         return
 
     try:
@@ -204,7 +442,7 @@ def status(ctx):
 
     if not pid_file.exists():
         click.echo("Gateway:    not running")
-        click.echo("\nRun 'gateway start' to start the gateway.")
+        click.echo("\nRun 'model-gateway start' to start the gateway.")
         return
 
     try:
@@ -305,7 +543,7 @@ def switch(ctx, alias):
     result = _gateway_request("POST", "/gateway/switch", port=config.port, json={"model": alias})
     if result is None:
         click.secho(
-            "Gateway not running. Run 'gateway start' first.", fg="red", err=True
+            "Gateway not running. Run 'model-gateway start' first.", fg="red", err=True
         )
         raise SystemExit(1)
 
@@ -316,14 +554,13 @@ def switch(ctx, alias):
 @click.argument("alias")
 @click.pass_context
 def test(ctx, alias):
-    """Send a test prompt to model ALIAS."""
+    """Send a test prompt through the gateway server."""
     try:
         config = load_config()
     except FileNotFoundError as e:
         click.secho(str(e), fg="red", err=True)
         raise SystemExit(1)
 
-    import httpx
 
     prompt = "Say 'hello' in one word."
     payload = {
@@ -341,7 +578,7 @@ def test(ctx, alias):
         data = resp.json()
     except httpx.ConnectError:
         click.secho(
-            "Gateway not running. Run 'gateway start' first.", fg="red", err=True
+            "Gateway not running. Run 'model-gateway start' first.", fg="red", err=True
         )
         raise SystemExit(1)
     except Exception as e:
@@ -470,7 +707,7 @@ def health(ctx):
     data = _gateway_request("GET", "/health", port=config.port)
     if data is None:
         click.secho(
-            "Gateway not running. Run 'gateway start' first.", fg="red", err=True
+            "Gateway not running. Run 'model-gateway start' first.", fg="red", err=True
         )
         raise SystemExit(1)
 
@@ -487,3 +724,268 @@ def health(ctx):
             model = info.get("model", "")
             detail = f" ({model})" if model and ok else ""
             click.echo(f"  {mark} {name}{detail}")
+
+
+# ---------------------------------------------------------------------------
+# Worker lifecycle
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def worker():
+    """Manage the persistent CLI worker (fast socket-based requests)."""
+
+
+@worker.command("start")
+@click.pass_context
+def worker_start(ctx):
+    """Start the CLI worker daemon."""
+    from model_gateway.worker import get_socket_path, get_worker_pid_file
+
+    pid_file = get_worker_pid_file()
+    if os.path.exists(pid_file):
+        try:
+            pid = int(open(pid_file).read().strip())
+            if _is_process_running(pid):
+                click.echo(f"Worker already running (PID {pid})")
+                return
+        except (ValueError, OSError):
+            pass
+
+    _start_worker_daemon()
+    quiet = ctx.obj.get("quiet", False)
+    if not quiet:
+        socket_path = get_socket_path()
+        click.secho(f"Worker started, listening on {socket_path}", fg="green")
+
+
+@worker.command("stop")
+@click.pass_context
+def worker_stop(ctx):
+    """Stop the CLI worker daemon."""
+    from model_gateway.worker import get_worker_pid_file
+
+    pid_file = get_worker_pid_file()
+    if not os.path.exists(pid_file):
+        click.echo("Worker is not running.")
+        return
+
+    try:
+        pid = int(open(pid_file).read().strip())
+    except (ValueError, OSError):
+        os.unlink(pid_file)
+        click.echo("Worker is not running.")
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.25)
+            if not _is_process_running(pid):
+                break
+    except ProcessLookupError:
+        pass
+
+    if os.path.exists(pid_file):
+        os.unlink(pid_file)
+    quiet = ctx.obj.get("quiet", False)
+    if not quiet:
+        click.secho("Worker stopped.", fg="green")
+
+
+@worker.command("status")
+def worker_status():
+    """Show CLI worker status."""
+    from model_gateway.worker import get_socket_path, get_worker_pid_file
+
+    pid_file = get_worker_pid_file()
+    socket_path = get_socket_path()
+
+    if not os.path.exists(pid_file):
+        click.echo("Worker:  not running")
+        return
+
+    try:
+        pid = int(open(pid_file).read().strip())
+    except (ValueError, OSError):
+        click.echo("Worker:  not running (stale PID file)")
+        return
+
+    if not _is_process_running(pid):
+        click.echo("Worker:  not running (stale PID file)")
+        return
+
+    click.echo(f"Worker:  running (PID {pid})")
+    click.echo(f"Socket:  {socket_path}")
+
+    # Ping for uptime
+    resp = _worker_request({"type": "ping"})
+    if resp and resp.get("pong"):
+        uptime = resp.get("uptime_s", 0)
+        m, s = divmod(uptime, 60)
+        h, m = divmod(m, 60)
+        click.echo(f"Uptime:  {int(h)}h {int(m)}m")
+
+
+# ---------------------------------------------------------------------------
+# Worker helpers
+# ---------------------------------------------------------------------------
+
+def _worker_request(request: dict) -> dict | None:
+    """Send a request to the worker, return first response or None if unavailable."""
+    from model_gateway.worker import get_socket_path
+    from model_gateway.socket_client import connect, send_request, iter_responses
+
+    socket_path = get_socket_path()
+    if not os.path.exists(socket_path):
+        return None
+
+    try:
+        sock = connect(socket_path)
+        send_request(sock, request)
+        for resp in iter_responses(sock):
+            return resp
+    except (ConnectionRefusedError, OSError):
+        return None
+    return None
+
+
+def _start_worker_daemon() -> None:
+    """Fork the worker process in the background."""
+    from model_gateway.worker import get_socket_path
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "model_gateway.worker"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait for socket to appear
+    socket_path = get_socket_path()
+    for _ in range(40):
+        if os.path.exists(socket_path):
+            return
+        time.sleep(0.05)
+
+
+def _try_worker_chat(model, messages, stream, max_tokens, json_output) -> bool:
+    """Try sending a chat request through the worker. Returns True if handled."""
+    from model_gateway.worker import get_socket_path
+    from model_gateway.socket_client import connect, send_request, iter_responses
+
+    socket_path = get_socket_path()
+    if not os.path.exists(socket_path):
+        return False
+
+    request = {
+        "type": "chat",
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if max_tokens is not None:
+        request["max_tokens"] = max_tokens
+
+    try:
+        sock = connect(socket_path)
+        send_request(sock, request)
+        for resp in iter_responses(sock):
+            if "error" in resp:
+                raise click.ClickException(resp["error"])
+            if "chunk" in resp:
+                click.echo(resp["chunk"], nl=False)
+            elif "content" in resp:
+                if json_output:
+                    click.echo(resp["content"])
+                else:
+                    click.echo(resp["content"])
+            if resp.get("done"):
+                if stream and "chunk" not in resp:
+                    pass  # no trailing newline needed
+                elif stream:
+                    click.echo()  # final newline after streamed chunks
+                latency = resp.get("latency_ms", 0)
+                click.echo(f"\n({latency}ms)", err=True)
+                break
+        sock.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+def _try_worker_embed(model, text) -> bool:
+    """Try sending an embed request through the worker. Returns True if handled."""
+    import json as _json
+    from model_gateway.worker import get_socket_path
+    from model_gateway.socket_client import connect, send_request, iter_responses
+
+    socket_path = get_socket_path()
+    if not os.path.exists(socket_path):
+        return False
+
+    try:
+        sock = connect(socket_path)
+        send_request(sock, {"type": "embed", "model": model, "text": text})
+        for resp in iter_responses(sock):
+            if "error" in resp:
+                raise click.ClickException(resp["error"])
+            if resp.get("done"):
+                data = resp.get("data", {})
+                embeddings = data.get("data", [])
+                if embeddings:
+                    vec = embeddings[0].get("embedding", [])
+                    click.echo(f"Dimensions: {len(vec)}")
+                    preview = ", ".join(f"{v:.6f}" for v in vec[:5])
+                    click.echo(f"Preview:    [{preview}, ...]")
+                    click.echo(_json.dumps(data), err=True)
+                latency = resp.get("latency_ms", 0)
+                click.echo(f"({latency}ms)", err=True)
+                break
+        sock.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+def _try_worker_complete(model, prompt_text, max_tokens) -> bool:
+    """Try sending a complete request through the worker. Returns True if handled."""
+    from model_gateway.worker import get_socket_path
+    from model_gateway.socket_client import connect, send_request, iter_responses
+
+    socket_path = get_socket_path()
+    if not os.path.exists(socket_path):
+        return False
+
+    try:
+        sock = connect(socket_path)
+        send_request(sock, {
+            "type": "complete",
+            "model": model,
+            "prompt": prompt_text,
+            "max_tokens": max_tokens,
+        })
+        for resp in iter_responses(sock):
+            if "error" in resp:
+                raise click.ClickException(resp["error"])
+            if resp.get("done"):
+                if resp.get("text"):
+                    click.echo(resp["text"])
+                latency = resp.get("latency_ms", 0)
+                click.echo(f"\n({latency}ms)", err=True)
+                break
+        sock.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _load_config_or_exit():
+    """Load config or exit with error message."""
+    try:
+        return load_config()
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e))

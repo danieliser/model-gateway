@@ -63,6 +63,7 @@ def mock_managers():
     mock_proxy.completion = AsyncMock(return_value={"choices": [{"message": {"content": "hi"}}]})
     mock_proxy.setup = MagicMock()
     mock_proxy.update_backend_url = MagicMock()
+    mock_proxy.close = AsyncMock()
 
     mock_router = MagicMock()
     mock_router.resolve_model.return_value = "haiku"
@@ -154,7 +155,7 @@ async def test_chat_completions_non_streaming(client):
     assert resp.status_code == 200
     data = resp.json()
     assert "choices" in data
-    mock_proxy.completion.assert_called_once_with("haiku", [{"role": "user", "content": "Say hi"}])
+    mock_proxy.completion.assert_called_once_with("haiku", [{"role": "user", "content": "Say hi"}], stream=False)
 
 
 # ---------------------------------------------------------------------------

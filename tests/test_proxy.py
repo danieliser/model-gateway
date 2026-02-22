@@ -183,7 +183,7 @@ async def test_completion_calls_router_acompletion():
 
 
 @pytest.mark.asyncio
-async def test_completion_passes_extra_kwargs():
+async def test_completion_cloud_passes_extra_kwargs():
     with patch("model_gateway.proxy.Router") as MockRouter:
         mock_router = MagicMock()
         fake_response = MagicMock()
@@ -195,10 +195,10 @@ async def test_completion_passes_extra_kwargs():
         proxy.setup({"mlx": 8801})
 
         messages = [{"role": "user", "content": "Summarize this"}]
-        result = await proxy.completion("local", messages, stream=True, temperature=0.7)
+        result = await proxy.completion("haiku", messages, stream=True, temperature=0.7)
 
         mock_router.acompletion.assert_called_once_with(
-            model="local",
+            model="haiku",
             messages=messages,
             stream=True,
             temperature=0.7,
@@ -211,5 +211,58 @@ async def test_completion_raises_without_setup():
     config = _make_config()
     proxy = ProxyManager(config)
 
+    # Cloud model with no router set up should raise
     with pytest.raises(RuntimeError, match="not initialized"):
-        await proxy.completion("local", [{"role": "user", "content": "hi"}])
+        await proxy.completion("haiku", [{"role": "user", "content": "hi"}])
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Local pass-through bypasses LiteLLM
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_local_passthrough_bypasses_litellm():
+    """Local backend completion should use httpx directly, not LiteLLM Router."""
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        mock_router = MagicMock()
+        mock_router.acompletion = AsyncMock()
+        MockRouter.return_value = mock_router
+
+        config = _make_config()
+        proxy = ProxyManager(config)
+        proxy.setup({"mlx": 8801})
+
+        # Mock the httpx client
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "hi"}}]}
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_response)
+        proxy._http_client = mock_http
+
+        messages = [{"role": "user", "content": "Hello"}]
+        result = await proxy.completion("local", messages, stream=False)
+
+        # LiteLLM should NOT be called
+        mock_router.acompletion.assert_not_called()
+        # httpx should be called with the backend URL
+        mock_http.post.assert_called_once()
+        call_url = mock_http.post.call_args[0][0]
+        assert "localhost:8801" in call_url
+        assert result is mock_response
+
+
+@pytest.mark.asyncio
+async def test_is_local_model():
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["mlx"] = "http://localhost:8801/v1"
+
+    is_local, api_base = proxy._is_local_model("local")
+    assert is_local is True
+    assert api_base == "http://localhost:8801/v1"
+
+    is_local, api_base = proxy._is_local_model("haiku")
+    assert is_local is False
+
+    is_local, api_base = proxy._is_local_model("nonexistent")
+    assert is_local is False

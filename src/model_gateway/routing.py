@@ -6,8 +6,6 @@ from model_gateway.config import GatewayConfig
 
 logger = logging.getLogger(__name__)
 
-_CLOUD_BACKENDS = {"anthropic", "openai"}
-
 
 class TaskRouter:
     def __init__(self, config: GatewayConfig):

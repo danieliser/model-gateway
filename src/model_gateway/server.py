@@ -60,6 +60,8 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    if _proxy_manager:
+        await _proxy_manager.close()
     if _backend_manager:
         await _backend_manager.cleanup()
 
@@ -92,20 +94,30 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         raise HTTPException(status_code=404, detail=str(exc))
 
     # Call through proxy
-    if stream:
-        async def generate():
-            async for chunk in await _proxy_manager.completion(
-                resolved_model, messages, stream=True
-            ):
-                yield f"data: {json.dumps(chunk)}\n\n"
-            yield "data: [DONE]\n\n"
+    result = await _proxy_manager.completion(resolved_model, messages, stream=stream)
 
-        return StreamingResponse(generate(), media_type="text/event-stream")
+    # httpx.Response = local pass-through, otherwise LiteLLM ModelResponse
+    if isinstance(result, httpx.Response):
+        if stream:
+            async def stream_raw():
+                async for line in result.aiter_lines():
+                    yield f"{line}\n"
+                await result.aclose()
+
+            return StreamingResponse(stream_raw(), media_type="text/event-stream")
+        else:
+            return JSONResponse(content=result.json())
     else:
-        result = await _proxy_manager.completion(resolved_model, messages)
-        # LiteLLM returns ModelResponse objects — convert to dict
-        content = result.model_dump() if hasattr(result, "model_dump") else result
-        return JSONResponse(content=content)
+        if stream:
+            async def generate():
+                async for chunk in result:
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(generate(), media_type="text/event-stream")
+        else:
+            content = result.model_dump() if hasattr(result, "model_dump") else result
+            return JSONResponse(content=content)
 
 
 @app.get("/v1/models")

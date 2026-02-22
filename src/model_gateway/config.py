@@ -91,7 +91,7 @@ def _parse_config(path: Path) -> GatewayConfig:
     )
 
 
-_CLOUD_BACKENDS = {"anthropic", "openai"}
+CLOUD_BACKENDS = {"anthropic", "openai"}
 
 
 def validate_config(config: GatewayConfig) -> list[str]:
@@ -117,7 +117,7 @@ def validate_config(config: GatewayConfig) -> list[str]:
             errors.append(
                 f"model '{model_name}' references unknown backend '{model.backend}'"
             )
-        if model.backend not in _CLOUD_BACKENDS:
+        if model.backend not in CLOUD_BACKENDS:
             if not model.model_id and not model.model_path:
                 errors.append(
                     f"model '{model_name}' uses local backend '{model.backend}' "
@@ -137,7 +137,7 @@ def validate_config(config: GatewayConfig) -> list[str]:
             )
 
     for backend_name, backend in config.backends.items():
-        if backend_name in _CLOUD_BACKENDS and backend.enabled and not backend.api_key_env:
+        if backend_name in CLOUD_BACKENDS and backend.enabled and not backend.api_key_env:
             errors.append(
                 f"cloud backend '{backend_name}' is enabled but has no api_key_env set"
             )

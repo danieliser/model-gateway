@@ -85,19 +85,18 @@ def test_is_mlx_available_not_arm64(monkeypatch):
     assert _is_mlx_available() is False
 
 
-def test_is_mlx_available_darwin_arm64_no_mlx(monkeypatch):
+def test_is_mlx_available_darwin_arm64_no_vllm(monkeypatch):
     monkeypatch.setattr("model_gateway.backends.sys.platform", "darwin")
     monkeypatch.setattr("model_gateway.backends.platform.machine", lambda: "arm64")
-    with patch("importlib.util.find_spec", return_value=None):
-        assert _is_mlx_available() is False
+    monkeypatch.setattr("model_gateway.backends.shutil.which", lambda name: None)
+    assert _is_mlx_available() is False
 
 
-def test_is_mlx_available_darwin_arm64_with_mlx(monkeypatch):
+def test_is_mlx_available_darwin_arm64_with_vllm(monkeypatch):
     monkeypatch.setattr("model_gateway.backends.sys.platform", "darwin")
     monkeypatch.setattr("model_gateway.backends.platform.machine", lambda: "arm64")
-    mock_spec = MagicMock()
-    with patch("importlib.util.find_spec", return_value=mock_spec):
-        assert _is_mlx_available() is True
+    monkeypatch.setattr("model_gateway.backends.shutil.which", lambda name: "/usr/local/bin/vllm-mlx" if name == "vllm-mlx" else None)
+    assert _is_mlx_available() is True
 
 
 def test_is_binary_available_existing():
@@ -150,13 +149,11 @@ async def test_start_backend_mlx_command_args(tmp_path, monkeypatch):
     result = await manager.start_backend("mlx", "local-mlx")
 
     assert result is True
-    assert "-m" in captured_cmd
-    assert "mlx_lm" in captured_cmd
-    assert "server" in captured_cmd
-    assert "--model" in captured_cmd
-    idx = captured_cmd.index("--model")
-    assert captured_cmd[idx + 1] == "mlx-community/Qwen3-4B-4bit"
+    assert captured_cmd[0] == "vllm-mlx"
+    assert "serve" in captured_cmd
+    assert "mlx-community/Qwen3-4B-4bit" in captured_cmd
     assert "--port" in captured_cmd
+    assert "--continuous-batching" in captured_cmd
 
 
 @pytest.mark.asyncio
