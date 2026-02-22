@@ -1,1 +1,276 @@
 """Backend adapters for local and remote model providers (mlx, ollama, anthropic, openai, etc.)."""
+
+import asyncio
+import logging
+import os
+import platform
+import shutil
+import signal
+import sys
+from dataclasses import dataclass
+
+import httpx
+
+from model_gateway.config import BackendConfig, GatewayConfig, ModelConfig, get_log_dir
+
+logger = logging.getLogger(__name__)
+
+_CLOUD_BACKENDS = {"anthropic", "openai"}
+_EXTERNAL_BACKENDS = {"ollama", "lm_studio", "lm-studio"}
+
+
+def _is_mlx_available() -> bool:
+    """Check macOS + arm64 + mlx_lm importable."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import importlib.util
+        return importlib.util.find_spec("mlx_lm") is not None
+    except Exception:
+        return False
+
+
+def _is_binary_available(name: str) -> bool:
+    """Check if binary exists in PATH."""
+    return shutil.which(name) is not None
+
+
+@dataclass
+class BackendStatus:
+    name: str
+    running: bool
+    port: int | None = None
+    pid: int | None = None
+    model_alias: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class _RunningBackend:
+    process: asyncio.subprocess.Process
+    port: int
+    pid: int
+    model: str
+    log_file: object  # file handle
+
+
+class BackendManager:
+    def __init__(self, config: GatewayConfig):
+        self._config = config
+        self._running: dict[str, _RunningBackend] = {}
+        self._status_errors: dict[str, str] = {}
+        self._next_port: int = 8801
+
+    def _alloc_port(self) -> int:
+        port = self._next_port
+        self._next_port += 1
+        return port
+
+    def _get_backend_cfg(self, backend_name: str) -> BackendConfig | None:
+        return self._config.backends.get(backend_name)
+
+    def _get_model_cfg(self, model_alias: str) -> ModelConfig | None:
+        return self._config.models.get(model_alias)
+
+    def _build_command(
+        self, backend_name: str, model_cfg: ModelConfig, port: int
+    ) -> list[str] | None:
+        """Build the startup command for a local backend."""
+        if backend_name == "mlx":
+            model_id = model_cfg.model_id or model_cfg.model_path
+            if not model_id:
+                return None
+            return [
+                sys.executable, "-m", "mlx_lm.server",
+                "--model", model_id,
+                "--port", str(port),
+            ]
+        elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
+            model_path = model_cfg.model_path or model_cfg.model_id
+            if not model_path:
+                return None
+            backend_cfg = self._get_backend_cfg(backend_name)
+            binary_name = (backend_cfg.binary if backend_cfg and backend_cfg.binary else "llama-server")
+            return [binary_name, "-m", model_path, "--port", str(port)]
+        return None
+
+    def _health_url(self, backend_name: str, port: int | None, backend_cfg: BackendConfig | None) -> str:
+        """Return the health check URL for a backend."""
+        if backend_name == "mlx":
+            return f"http://localhost:{port}/v1/models"
+        elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
+            return f"http://localhost:{port}/health"
+        elif backend_name == "ollama":
+            host = (backend_cfg.host if backend_cfg and backend_cfg.host else "http://localhost:11434")
+            return f"{host}/api/tags"
+        elif backend_name in ("lm_studio", "lm-studio"):
+            host = (backend_cfg.host if backend_cfg and backend_cfg.host else "http://localhost:1234")
+            return f"{host}/v1/models"
+        return ""
+
+    async def start_backend(self, backend_name: str, model_alias: str) -> bool:
+        """Start a local backend server for the given model. Returns True if started successfully."""
+        if backend_name in self._running:
+            logger.debug("Backend %s already running", backend_name)
+            return True
+
+        backend_cfg = self._get_backend_cfg(backend_name)
+        model_cfg = self._get_model_cfg(model_alias)
+
+        if model_cfg is None:
+            self._status_errors[backend_name] = f"Unknown model alias: {model_alias}"
+            return False
+
+        # External / cloud backends don't need subprocess
+        if backend_name in _CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
+            return True
+
+        port = self._alloc_port()
+        cmd = self._build_command(backend_name, model_cfg, port)
+        if cmd is None:
+            self._status_errors[backend_name] = f"Cannot build command for backend '{backend_name}'"
+            return False
+
+        log_path = get_log_dir() / f"{backend_name}.log"
+
+        for attempt in range(3):
+            try:
+                log_file = open(log_path, "ab")
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+                self._running[backend_name] = _RunningBackend(
+                    process=process,
+                    port=port,
+                    pid=process.pid,
+                    model=model_alias,
+                    log_file=log_file,
+                )
+                self._status_errors.pop(backend_name, None)
+
+                # Wait for health
+                if await self._wait_for_health(backend_name, port, backend_cfg):
+                    logger.info("Backend %s started (pid=%d, port=%d)", backend_name, process.pid, port)
+                    return True
+
+                # Health failed — process may have crashed
+                logger.warning("Backend %s health check failed (attempt %d/3)", backend_name, attempt + 1)
+                await self.stop_backend(backend_name)
+
+            except Exception as exc:
+                logger.error("Error starting backend %s: %s", backend_name, exc)
+                self._status_errors[backend_name] = str(exc)
+                self._running.pop(backend_name, None)
+
+        self._status_errors[backend_name] = f"Backend '{backend_name}' failed after 3 attempts"
+        return False
+
+    async def _wait_for_health(
+        self, backend_name: str, port: int, backend_cfg: BackendConfig | None, timeout: float = 30.0
+    ) -> bool:
+        url = self._health_url(backend_name, port, backend_cfg)
+        if not url:
+            return True  # no health check available
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        async with httpx.AsyncClient() as client:
+            while loop.time() < deadline:
+                try:
+                    resp = await client.get(url, timeout=2.0)
+                    if resp.status_code < 500:
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(2.0)
+        return False
+
+    async def stop_backend(self, backend_name: str) -> None:
+        """Graceful shutdown: SIGTERM, wait 5s, SIGKILL if needed."""
+        info = self._running.pop(backend_name, None)
+        if info is None:
+            return
+
+        proc = info.process
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.send_signal(signal.SIGKILL)
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+
+        try:
+            info.log_file.close()
+        except Exception:
+            pass
+
+        logger.info("Backend %s stopped", backend_name)
+
+    async def health_check(self, backend_name: str) -> bool:
+        """HTTP health probe to local server. Returns True if healthy."""
+        backend_cfg = self._get_backend_cfg(backend_name)
+
+        # Cloud backends: check env var
+        if backend_name in _CLOUD_BACKENDS:
+            if backend_cfg and backend_cfg.api_key_env:
+                return os.environ.get(backend_cfg.api_key_env) is not None
+            return False
+
+        # Running subprocess backends
+        port = None
+        if backend_name in self._running:
+            port = self._running[backend_name].port
+
+        url = self._health_url(backend_name, port, backend_cfg)
+        if not url:
+            return False
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=5.0)
+                return resp.status_code < 500
+        except Exception:
+            return False
+
+    async def switch_model(self, backend_name: str, model_alias: str) -> bool:
+        """Stop current model on backend, start new one. Returns True on success."""
+        await self.stop_backend(backend_name)
+        return await self.start_backend(backend_name, model_alias)
+
+    def get_status(self) -> dict[str, BackendStatus]:
+        """Return status of all backends."""
+        result: dict[str, BackendStatus] = {}
+
+        for name, info in self._running.items():
+            result[name] = BackendStatus(
+                name=name,
+                running=True,
+                port=info.port,
+                pid=info.pid,
+                model_alias=info.model,
+            )
+
+        for name in self._config.backends:
+            if name not in result:
+                error = self._status_errors.get(name)
+                result[name] = BackendStatus(
+                    name=name,
+                    running=False,
+                    error=error,
+                )
+
+        return result
+
+    async def cleanup(self) -> None:
+        """Stop all running backends. Called on gateway shutdown."""
+        names = list(self._running.keys())
+        for name in names:
+            await self.stop_backend(name)
