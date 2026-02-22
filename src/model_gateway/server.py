@@ -42,10 +42,17 @@ async def startup() -> None:
     if _config.default_model and _config.default_model in _config.models:
         model = _config.models[_config.default_model]
         if model.backend not in ("anthropic", "openai"):
-            await _backend_manager.start_backend(model.backend, _config.default_model)
-            port = _backend_manager.get_status()[model.backend].port
-            if port:
-                _proxy_manager.setup({model.backend: port})
+            started = await _backend_manager.start_backend(model.backend, _config.default_model)
+            if started:
+                port = _backend_manager.get_status()[model.backend].port
+                if port:
+                    _proxy_manager.setup({model.backend: port})
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Default backend '%s' failed to start — gateway will serve cloud models only",
+                    model.backend,
+                )
 
     # Setup proxy for cloud backends (and any already-running local ones)
     _proxy_manager.setup(_get_backend_ports())
@@ -96,7 +103,9 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
         result = await _proxy_manager.completion(resolved_model, messages)
-        return JSONResponse(content=result)
+        # LiteLLM returns ModelResponse objects — convert to dict
+        content = result.model_dump() if hasattr(result, "model_dump") else result
+        return JSONResponse(content=content)
 
 
 @app.get("/v1/models")

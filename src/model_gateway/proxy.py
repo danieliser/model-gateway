@@ -4,6 +4,7 @@ import logging
 from typing import Any, AsyncGenerator
 
 import litellm
+from litellm import Router
 
 from model_gateway.config import GatewayConfig
 
@@ -14,22 +15,12 @@ _CLOUD_BACKENDS = {"anthropic", "openai"}
 
 class ProxyManager:
     def __init__(self, config: GatewayConfig):
-        """Configure LiteLLM with model aliases from our config."""
         self._config = config
-        # Track current backend URLs so we can update them without full re-setup
         self._backend_urls: dict[str, str] = {}
+        self._router: Router | None = None
 
     def setup(self, backend_ports: dict[str, int]) -> None:
-        """Configure LiteLLM model routing.
-
-        - For local backends (mlx, llama-cpp): register as OpenAI-compatible
-          at http://localhost:<port>/v1
-        - For cloud backends (anthropic): use litellm's native provider format
-        - For cloud backends (openai): use litellm's native format
-
-        Sets litellm.model_list with our model aliases.
-        """
-        # Store resolved URLs for local backends
+        """Configure LiteLLM Router with model aliases from our config."""
         for backend_name, port in backend_ports.items():
             self._backend_urls[backend_name] = f"http://localhost:{port}/v1"
 
@@ -39,7 +30,10 @@ class ProxyManager:
             if entry is not None:
                 model_list.append(entry)
 
-        litellm.model_list = model_list
+        if model_list:
+            self._router = Router(model_list=model_list)
+        else:
+            logger.warning("No models configured for LiteLLM Router")
 
     def _build_model_entry(self, alias: str, model_cfg: Any) -> dict | None:
         """Build a single LiteLLM model_list entry."""
@@ -94,14 +88,8 @@ class ProxyManager:
         new_url = f"http://localhost:{port}/v1"
         self._backend_urls[backend_name] = new_url
 
-        # Update existing entries in litellm.model_list
-        for entry in litellm.model_list:
-            params = entry.get("litellm_params", {})
-            if params.get("api_base", "").startswith("http://localhost:"):
-                alias = entry["model_name"]
-                model_cfg = self._config.models.get(alias)
-                if model_cfg and model_cfg.backend == backend_name:
-                    params["api_base"] = new_url
+        # Re-setup router with updated URLs
+        self.setup({backend_name: port})
 
     async def completion(
         self,
@@ -110,13 +98,11 @@ class ProxyManager:
         stream: bool = False,
         **kwargs: Any,
     ) -> Any:
-        """Route a chat completion through LiteLLM.
+        """Route a chat completion through LiteLLM Router."""
+        if self._router is None:
+            raise RuntimeError("ProxyManager not initialized — call setup() first")
 
-        Uses litellm.acompletion() for async.
-        For streaming: returns async generator.
-        For non-streaming: returns completion response.
-        """
-        response = await litellm.acompletion(
+        response = await self._router.acompletion(
             model=model,
             messages=messages,
             stream=stream,

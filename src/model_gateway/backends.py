@@ -6,7 +6,9 @@ import os
 import platform
 import shutil
 import signal
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -47,7 +49,7 @@ class BackendStatus:
 
 @dataclass
 class _RunningBackend:
-    process: asyncio.subprocess.Process
+    process: subprocess.Popen
     port: int
     pid: int
     model: str
@@ -81,7 +83,7 @@ class BackendManager:
             if not model_id:
                 return None
             return [
-                sys.executable, "-m", "mlx_lm.server",
+                sys.executable, "-m", "mlx_lm", "server",
                 "--model", model_id,
                 "--port", str(port),
             ]
@@ -108,11 +110,21 @@ class BackendManager:
             return f"{host}/v1/models"
         return ""
 
+    def _is_process_alive(self, backend_name: str) -> bool:
+        """Check if the backend's process is still running."""
+        info = self._running.get(backend_name)
+        if info is None:
+            return False
+        return info.process.poll() is None
+
     async def start_backend(self, backend_name: str, model_alias: str) -> bool:
         """Start a local backend server for the given model. Returns True if started successfully."""
         if backend_name in self._running:
-            logger.debug("Backend %s already running", backend_name)
-            return True
+            if self._is_process_alive(backend_name):
+                logger.debug("Backend %s already running", backend_name)
+                return True
+            # Process died — clean up stale entry
+            self._cleanup_stale(backend_name)
 
         backend_cfg = self._get_backend_cfg(backend_name)
         model_cfg = self._get_model_cfg(model_alias)
@@ -125,8 +137,7 @@ class BackendManager:
         if backend_name in _CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
             return True
 
-        port = self._alloc_port()
-        cmd = self._build_command(backend_name, model_cfg, port)
+        cmd = self._build_command(backend_name, model_cfg, self._alloc_port())
         if cmd is None:
             self._status_errors[backend_name] = f"Cannot build command for backend '{backend_name}'"
             return False
@@ -134,12 +145,16 @@ class BackendManager:
         log_path = get_log_dir() / f"{backend_name}.log"
 
         for attempt in range(3):
+            port = self._running[backend_name].port if backend_name in self._running else self._next_port - 1
             try:
                 log_file = open(log_path, "ab")
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
+                # Use subprocess.Popen with start_new_session to fully detach
+                # from uvicorn's process group and signal handling.
+                process = subprocess.Popen(
+                    cmd,
                     stdout=log_file,
                     stderr=log_file,
+                    start_new_session=True,
                 )
                 self._running[backend_name] = _RunningBackend(
                     process=process,
@@ -155,9 +170,16 @@ class BackendManager:
                     logger.info("Backend %s started (pid=%d, port=%d)", backend_name, process.pid, port)
                     return True
 
-                # Health failed — process may have crashed
-                logger.warning("Backend %s health check failed (attempt %d/3)", backend_name, attempt + 1)
-                await self.stop_backend(backend_name)
+                # Check if process crashed vs just slow
+                if process.poll() is not None:
+                    logger.warning("Backend %s process exited (code=%s, attempt %d/3)", backend_name, process.returncode, attempt + 1)
+                else:
+                    logger.warning("Backend %s health check timed out (attempt %d/3)", backend_name, attempt + 1)
+
+                self._stop_backend_sync(backend_name)
+
+                # Wait for port release before retry
+                await asyncio.sleep(2.0)
 
             except Exception as exc:
                 logger.error("Error starting backend %s: %s", backend_name, exc)
@@ -168,15 +190,17 @@ class BackendManager:
         return False
 
     async def _wait_for_health(
-        self, backend_name: str, port: int, backend_cfg: BackendConfig | None, timeout: float = 30.0
+        self, backend_name: str, port: int, backend_cfg: BackendConfig | None, timeout: float = 120.0
     ) -> bool:
         url = self._health_url(backend_name, port, backend_cfg)
         if not url:
             return True  # no health check available
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
+        deadline = time.monotonic() + timeout
         async with httpx.AsyncClient() as client:
-            while loop.time() < deadline:
+            while time.monotonic() < deadline:
+                # Check if process died while we're waiting
+                if not self._is_process_alive(backend_name):
+                    return False
                 try:
                     resp = await client.get(url, timeout=2.0)
                     if resp.status_code < 500:
@@ -186,26 +210,36 @@ class BackendManager:
                 await asyncio.sleep(2.0)
         return False
 
-    async def stop_backend(self, backend_name: str) -> None:
-        """Graceful shutdown: SIGTERM, wait 5s, SIGKILL if needed."""
+    def _cleanup_stale(self, backend_name: str) -> None:
+        """Remove a stale entry for a dead process."""
+        info = self._running.pop(backend_name, None)
+        if info:
+            try:
+                info.log_file.close()
+            except Exception:
+                pass
+
+    def _stop_backend_sync(self, backend_name: str) -> None:
+        """Stop a backend process synchronously."""
         info = self._running.pop(backend_name, None)
         if info is None:
             return
 
         proc = info.process
-        try:
-            proc.send_signal(signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
+        if proc.poll() is None:
             try:
-                proc.send_signal(signal.SIGKILL)
-                await proc.wait()
+                os.kill(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=2.0)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
 
         try:
             info.log_file.close()
@@ -213,6 +247,10 @@ class BackendManager:
             pass
 
         logger.info("Backend %s stopped", backend_name)
+
+    async def stop_backend(self, backend_name: str) -> None:
+        """Graceful shutdown: SIGTERM, wait 5s, SIGKILL if needed."""
+        self._stop_backend_sync(backend_name)
 
     async def health_check(self, backend_name: str) -> bool:
         """HTTP health probe to local server. Returns True if healthy."""
@@ -227,6 +265,9 @@ class BackendManager:
         # Running subprocess backends
         port = None
         if backend_name in self._running:
+            if not self._is_process_alive(backend_name):
+                self._cleanup_stale(backend_name)
+                return False
             port = self._running[backend_name].port
 
         url = self._health_url(backend_name, port, backend_cfg)
@@ -249,14 +290,17 @@ class BackendManager:
         """Return status of all backends."""
         result: dict[str, BackendStatus] = {}
 
-        for name, info in self._running.items():
-            result[name] = BackendStatus(
-                name=name,
-                running=True,
-                port=info.port,
-                pid=info.pid,
-                model_alias=info.model,
-            )
+        for name, info in list(self._running.items()):
+            if self._is_process_alive(name):
+                result[name] = BackendStatus(
+                    name=name,
+                    running=True,
+                    port=info.port,
+                    pid=info.pid,
+                    model_alias=info.model,
+                )
+            else:
+                self._cleanup_stale(name)
 
         for name in self._config.backends:
             if name not in result:

@@ -475,15 +475,15 @@ def health(ctx):
         raise SystemExit(1)
 
     overall = data.get("status", "unknown")
-    color = "green" if overall == "ok" else "yellow" if overall == "degraded" else "red"
+    color = "green" if overall in ("ok", "healthy") else "yellow" if overall == "degraded" else "red"
     click.secho(f"Status:  {overall}", fg=color)
 
     backends = data.get("backends", {})
     if backends:
         click.echo("\nBackends:")
         for name, info in backends.items():
-            ok = info.get("available", False)
+            ok = info.get("running", False)
             mark = click.style("✓", fg="green") if ok else click.style("✗", fg="red")
-            reason = info.get("reason", "")
-            detail = f" — {reason}" if reason else ""
+            model = info.get("model", "")
+            detail = f" ({model})" if model and ok else ""
             click.echo(f"  {mark} {name}{detail}")

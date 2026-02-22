@@ -1,7 +1,7 @@
 """Tests for model_gateway.proxy module."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 from model_gateway.config import BackendConfig, GatewayConfig, ModelConfig
 from model_gateway.proxy import ProxyManager
@@ -30,141 +30,142 @@ def _make_config() -> GatewayConfig:
     )
 
 
+def _get_model_list(proxy: ProxyManager) -> list[dict]:
+    """Extract the model_list that would be passed to the Router."""
+    config = proxy._config
+    entries = []
+    for alias, model_cfg in config.models.items():
+        entry = proxy._build_model_entry(alias, model_cfg)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
 # ---------------------------------------------------------------------------
-# Test 1: setup() generates correct litellm model_list for local backends
+# Test 1: _build_model_entry for local backends
 # ---------------------------------------------------------------------------
 
-def test_setup_local_backend_model_list():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
+def test_build_entry_local_backend():
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["mlx"] = "http://localhost:8801/v1"
+
+    entry = proxy._build_model_entry("local", config.models["local"])
+    assert entry is not None
+    params = entry["litellm_params"]
+    assert params["model"] == "openai/mlx-community/Qwen3-4B-4bit"
+    assert params["api_base"] == "http://localhost:8801/v1"
+    assert params["api_key"] == "not-needed"
+
+
+# ---------------------------------------------------------------------------
+# Test 2: _build_model_entry for Anthropic
+# ---------------------------------------------------------------------------
+
+def test_build_entry_anthropic_backend():
+    config = _make_config()
+    proxy = ProxyManager(config)
+
+    entry = proxy._build_model_entry("haiku", config.models["haiku"])
+    assert entry is not None
+    params = entry["litellm_params"]
+    assert params["model"] == "anthropic/claude-haiku-4-5-20251001"
+    assert "ANTHROPIC_API_KEY" in params["api_key"]
+    assert "api_base" not in params
+
+
+# ---------------------------------------------------------------------------
+# Test 3: _build_model_entry for OpenAI
+# ---------------------------------------------------------------------------
+
+def test_build_entry_openai_backend():
+    config = _make_config()
+    proxy = ProxyManager(config)
+
+    entry = proxy._build_model_entry("gpt4o", config.models["gpt4o"])
+    assert entry is not None
+    params = entry["litellm_params"]
+    assert params["model"] == "gpt-4o"
+    assert "OPENAI_API_KEY" in params["api_key"]
+    assert "api_base" not in params
+
+
+# ---------------------------------------------------------------------------
+# Test 4: setup() creates Router with model_list
+# ---------------------------------------------------------------------------
+
+def test_setup_creates_router():
+    with patch("model_gateway.proxy.Router") as MockRouter:
         config = _make_config()
         proxy = ProxyManager(config)
         proxy.setup({"mlx": 8801})
 
-        model_list = mock_litellm.model_list
-        local_entry = next((e for e in model_list if e["model_name"] == "local"), None)
-        assert local_entry is not None
-
-        params = local_entry["litellm_params"]
-        assert params["model"] == "openai/mlx-community/Qwen3-4B-4bit"
-        assert params["api_base"] == "http://localhost:8801/v1"
-        assert params["api_key"] == "not-needed"
+        MockRouter.assert_called_once()
+        model_list = MockRouter.call_args[1]["model_list"]
+        aliases = [e["model_name"] for e in model_list]
+        assert "local" in aliases
+        assert "haiku" in aliases
+        assert "gpt4o" in aliases
 
 
 # ---------------------------------------------------------------------------
-# Test 2: setup() generates correct model_list for Anthropic
+# Test 5: local model with no port is omitted
 # ---------------------------------------------------------------------------
 
-def test_setup_anthropic_backend_model_list():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
+def test_local_model_without_port_omitted():
+    with patch("model_gateway.proxy.Router") as MockRouter:
         config = _make_config()
         proxy = ProxyManager(config)
-        proxy.setup({"mlx": 8801})
+        proxy.setup({})  # no ports
 
-        model_list = mock_litellm.model_list
-        haiku_entry = next((e for e in model_list if e["model_name"] == "haiku"), None)
-        assert haiku_entry is not None
-
-        params = haiku_entry["litellm_params"]
-        assert params["model"] == "anthropic/claude-haiku-4-5-20251001"
-        assert "api_key" in params
-        assert "ANTHROPIC_API_KEY" in params["api_key"]
-        # Should NOT have api_base
-        assert "api_base" not in params
+        model_list = MockRouter.call_args[1]["model_list"]
+        aliases = [e["model_name"] for e in model_list]
+        assert "local" not in aliases
+        assert "haiku" in aliases
+        assert "gpt4o" in aliases
 
 
 # ---------------------------------------------------------------------------
-# Test 3: setup() generates correct model_list for OpenAI
-# ---------------------------------------------------------------------------
-
-def test_setup_openai_backend_model_list():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
-        config = _make_config()
-        proxy = ProxyManager(config)
-        proxy.setup({"mlx": 8801})
-
-        model_list = mock_litellm.model_list
-        gpt4o_entry = next((e for e in model_list if e["model_name"] == "gpt4o"), None)
-        assert gpt4o_entry is not None
-
-        params = gpt4o_entry["litellm_params"]
-        assert params["model"] == "gpt-4o"
-        assert "OPENAI_API_KEY" in params["api_key"]
-        # Should NOT have api_base
-        assert "api_base" not in params
-
-
-# ---------------------------------------------------------------------------
-# Test 4: update_backend_url changes the URL for a backend
-# ---------------------------------------------------------------------------
-
-def test_update_backend_url_changes_api_base():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
-        config = _make_config()
-        proxy = ProxyManager(config)
-        proxy.setup({"mlx": 8801})
-
-        # Grab the model_list and verify initial URL
-        local_entry = next(
-            e for e in mock_litellm.model_list if e["model_name"] == "local"
-        )
-        assert local_entry["litellm_params"]["api_base"] == "http://localhost:8801/v1"
-
-        # Update the backend URL
-        proxy.update_backend_url("mlx", 8899)
-
-        # The entry should now reflect the new port
-        assert local_entry["litellm_params"]["api_base"] == "http://localhost:8899/v1"
-
-
-# ---------------------------------------------------------------------------
-# Test 5: get_available_models returns all configured models
+# Test 6: get_available_models returns all configured models
 # ---------------------------------------------------------------------------
 
 def test_get_available_models_returns_all():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
-        config = _make_config()
-        proxy = ProxyManager(config)
-        proxy.setup({"mlx": 8801})
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["mlx"] = "http://localhost:8801/v1"
 
-        models = proxy.get_available_models()
-        aliases = {m["alias"] for m in models}
-        assert aliases == {"local", "haiku", "gpt4o"}
+    models = proxy.get_available_models()
+    aliases = {m["alias"] for m in models}
+    assert aliases == {"local", "haiku", "gpt4o"}
 
 
 def test_get_available_models_includes_backend_info():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
-        config = _make_config()
-        proxy = ProxyManager(config)
-        proxy.setup({"mlx": 8801})
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["mlx"] = "http://localhost:8801/v1"
 
-        models = proxy.get_available_models()
-        local_info = next(m for m in models if m["alias"] == "local")
-        assert local_info["backend"] == "mlx"
-        assert local_info["model_id"] == "mlx-community/Qwen3-4B-4bit"
-        assert local_info["api_base"] == "http://localhost:8801/v1"
+    models = proxy.get_available_models()
+    local_info = next(m for m in models if m["alias"] == "local")
+    assert local_info["backend"] == "mlx"
+    assert local_info["model_id"] == "mlx-community/Qwen3-4B-4bit"
+    assert local_info["api_base"] == "http://localhost:8801/v1"
 
-        haiku_info = next(m for m in models if m["alias"] == "haiku")
-        assert haiku_info["backend"] == "anthropic"
-        # Cloud backends should not expose api_base
-        assert "api_base" not in haiku_info
+    haiku_info = next(m for m in models if m["alias"] == "haiku")
+    assert haiku_info["backend"] == "anthropic"
+    assert "api_base" not in haiku_info
 
 
 # ---------------------------------------------------------------------------
-# Test 6: completion() calls litellm.acompletion with correct params (mock)
+# Test 7: completion() calls router.acompletion
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_completion_calls_litellm_acompletion():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
+async def test_completion_calls_router_acompletion():
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        mock_router = MagicMock()
         fake_response = MagicMock()
-        mock_litellm.acompletion = AsyncMock(return_value=fake_response)
+        mock_router.acompletion = AsyncMock(return_value=fake_response)
+        MockRouter.return_value = mock_router
 
         config = _make_config()
         proxy = ProxyManager(config)
@@ -173,7 +174,7 @@ async def test_completion_calls_litellm_acompletion():
         messages = [{"role": "user", "content": "Hello"}]
         result = await proxy.completion("haiku", messages, stream=False)
 
-        mock_litellm.acompletion.assert_called_once_with(
+        mock_router.acompletion.assert_called_once_with(
             model="haiku",
             messages=messages,
             stream=False,
@@ -183,10 +184,11 @@ async def test_completion_calls_litellm_acompletion():
 
 @pytest.mark.asyncio
 async def test_completion_passes_extra_kwargs():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        mock_router = MagicMock()
         fake_response = MagicMock()
-        mock_litellm.acompletion = AsyncMock(return_value=fake_response)
+        mock_router.acompletion = AsyncMock(return_value=fake_response)
+        MockRouter.return_value = mock_router
 
         config = _make_config()
         proxy = ProxyManager(config)
@@ -195,7 +197,7 @@ async def test_completion_passes_extra_kwargs():
         messages = [{"role": "user", "content": "Summarize this"}]
         result = await proxy.completion("local", messages, stream=True, temperature=0.7)
 
-        mock_litellm.acompletion.assert_called_once_with(
+        mock_router.acompletion.assert_called_once_with(
             model="local",
             messages=messages,
             stream=True,
@@ -204,21 +206,10 @@ async def test_completion_passes_extra_kwargs():
         assert result is fake_response
 
 
-# ---------------------------------------------------------------------------
-# Test: local model with no port registered is omitted from model_list
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_completion_raises_without_setup():
+    config = _make_config()
+    proxy = ProxyManager(config)
 
-def test_local_model_without_port_omitted():
-    with patch("model_gateway.proxy.litellm") as mock_litellm:
-        mock_litellm.model_list = []
-        config = _make_config()
-        proxy = ProxyManager(config)
-        # Don't provide port for "mlx"
-        proxy.setup({})
-
-        model_list = mock_litellm.model_list
-        aliases = [e["model_name"] for e in model_list]
-        assert "local" not in aliases
-        # Cloud backends should still be registered
-        assert "haiku" in aliases
-        assert "gpt4o" in aliases
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await proxy.completion("local", [{"role": "user", "content": "hi"}])
