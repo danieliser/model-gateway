@@ -131,6 +131,7 @@ def test_port_allocation():
 @pytest.mark.asyncio
 async def test_start_backend_mlx_command_args(tmp_path, monkeypatch):
     """start_backend for MLX should call Popen with correct args."""
+    monkeypatch.setattr(BackendManager, "_is_model_cached", lambda self, model_id: True)
     config = _make_config()
     manager = BackendManager(config)
 

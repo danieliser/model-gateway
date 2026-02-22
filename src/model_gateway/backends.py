@@ -74,6 +74,19 @@ class BackendManager:
     def _get_model_cfg(self, model_alias: str) -> ModelConfig | None:
         return self._config.models.get(model_alias)
 
+    def _is_model_cached(self, model_id: str) -> bool:
+        """Check if a HuggingFace model is already downloaded locally."""
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            # Check for config.json as a proxy — every model has one
+            result = try_to_load_from_cache(model_id, "config.json")
+            return result is not None and isinstance(result, str)
+        except ImportError:
+            # If huggingface_hub isn't available, assume not cached
+            return False
+        except Exception:
+            return False
+
     def _build_command(
         self, backend_name: str, model_cfg: ModelConfig, port: int
     ) -> list[str] | None:
@@ -81,6 +94,14 @@ class BackendManager:
         if backend_name == "mlx":
             model_id = model_cfg.model_id or model_cfg.model_path
             if not model_id:
+                return None
+            if not self._is_model_cached(model_id):
+                logger.warning(
+                    "Model '%s' not found locally. Download it first with: "
+                    "huggingface-cli download %s",
+                    model_id, model_id,
+                )
+                self._status_errors[backend_name] = f"Model '{model_id}' not downloaded"
                 return None
             return [
                 sys.executable, "-m", "mlx_lm", "server",
