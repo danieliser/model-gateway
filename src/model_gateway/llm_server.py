@@ -109,15 +109,31 @@ class LlmManager:
 
     def _format_prompt(self, info: _LoadedLlmModel, messages: list[dict]) -> str:
         """Apply chat template to format messages into a prompt string."""
-        try:
-            return info.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-        except Exception:
-            # Fallback if tokenizer doesn't support tools/kwargs
-            return info.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+        return info.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    def _strip_stop_tokens(self, info: _LoadedLlmModel, text: str) -> str:
+        """Strip EOS / chat-template stop tokens from generated text."""
+        # Collect known stop strings from tokenizer
+        stop_strings: list[str] = []
+        eos = getattr(info.tokenizer, "eos_token", None)
+        if isinstance(eos, str) and eos:
+            stop_strings.append(eos)
+        # Many chat models define additional stop tokens (e.g. <|im_end|>)
+        extra = getattr(info.tokenizer, "additional_special_tokens", None)
+        if isinstance(extra, list):
+            stop_strings.extend(t for t in extra if isinstance(t, str))
+        # Also check chat_template stop tokens if present
+        if hasattr(info.tokenizer, "chat_template") and info.tokenizer.chat_template:
+            for candidate in ("<|im_end|>", "<|eot_id|>", "</s>", "<|end|>"):
+                if candidate in info.tokenizer.chat_template and candidate not in stop_strings:
+                    stop_strings.append(candidate)
+
+        for s in stop_strings:
+            if text.endswith(s):
+                text = text[: -len(s)]
+        return text.rstrip()
 
     def _build_sampling_params(self, **kwargs: Any) -> Any:
         """Build SamplingParams from request kwargs."""
@@ -173,7 +189,7 @@ class LlmManager:
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": final_output.output_text,
+                    "content": self._strip_stop_tokens(info, final_output.output_text),
                 },
                 "finish_reason": final_output.finish_reason or "stop",
             }],
@@ -223,7 +239,7 @@ class LlmManager:
                     "model": info.model_name,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": output.new_text},
+                        "delta": {"content": self._strip_stop_tokens(info, output.new_text)},
                         "finish_reason": None,
                     }],
                 }
