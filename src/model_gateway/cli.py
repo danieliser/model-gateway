@@ -34,6 +34,37 @@ def _is_process_running(pid: int) -> bool:
         return True
 
 
+def _find_pid_on_port(port: int) -> int | None:
+    """Find the PID of the process listening on the given port."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # May return multiple PIDs (one per line); take the first
+            return int(result.stdout.strip().splitlines()[0])
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        pass
+    return None
+
+
+def _kill_pid(pid: int) -> None:
+    """SIGTERM a process, wait, SIGKILL if needed."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(20):
+        time.sleep(0.5)
+        if not _is_process_running(pid):
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def _wait_for_health(port: int, timeout: float = 15.0) -> bool:
     """Poll gateway /health endpoint until it responds or timeout."""
     deadline = time.time() + timeout
@@ -392,28 +423,37 @@ def stop(ctx):
     """Stop the running gateway server."""
     quiet = ctx.obj.get("quiet", False)
 
+    try:
+        config = load_config()
+        port = config.port
+    except FileNotFoundError:
+        port = 8800
+
+    pids_to_kill: set[int] = set()
+
+    # 1. PID from file
     pid_file = get_pid_file()
-    if not pid_file.exists():
-        click.echo("Gateway is not running. Run 'model-gateway start' first.")
-        return
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if _is_process_running(pid):
+                pids_to_kill.add(pid)
+        except (ValueError, OSError):
+            pass
 
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
+    # 2. Find process actually listening on the port (handles stale PID file)
+    port_pid = _find_pid_on_port(port)
+    if port_pid:
+        pids_to_kill.add(port_pid)
+
+    if not pids_to_kill:
         pid_file.unlink(missing_ok=True)
-        click.echo("Gateway is not running.")
+        if not quiet:
+            click.echo("Gateway is not running.")
         return
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(20):
-            time.sleep(0.5)
-            if not _is_process_running(pid):
-                break
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    for pid in pids_to_kill:
+        _kill_pid(pid)
 
     pid_file.unlink(missing_ok=True)
     if not quiet:
