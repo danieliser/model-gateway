@@ -62,6 +62,8 @@ def mock_managers():
     mock_backend.stop_idle_monitor = MagicMock()
     mock_backend._embed_manager = MagicMock()
     mock_backend._embed_manager.is_loaded = MagicMock(return_value=False)
+    mock_backend._llm_manager = MagicMock()
+    mock_backend._llm_manager.is_loaded = MagicMock(return_value=False)
 
     mock_proxy = MagicMock()
     mock_proxy.get_available_models.return_value = [
@@ -378,14 +380,14 @@ async def test_load_model_unknown_returns_404(client):
 @pytest.mark.asyncio
 async def test_unload_model_endpoint(client):
     ac, mock_backend, mock_proxy, _ = client
-    mock_backend.unload_model = MagicMock(return_value=True)
+    mock_backend.unload_model_async = AsyncMock(return_value=True)
 
     resp = await ac.post("/gateway/models/unload", json={"model": "local"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["success"] is True
     assert data["model"] == "local"
-    mock_backend.unload_model.assert_called_once_with("local")
+    mock_backend.unload_model_async.assert_called_once_with("local")
     mock_proxy.on_model_unloaded.assert_called_once_with("local", "mlx")
 
 
@@ -399,7 +401,7 @@ async def test_unload_model_unknown_returns_404(client):
 @pytest.mark.asyncio
 async def test_unload_pinned_model_returns_success_false(client):
     ac, mock_backend, mock_proxy, _ = client
-    mock_backend.unload_model = MagicMock(return_value=False)
+    mock_backend.unload_model_async = AsyncMock(return_value=False)
 
     resp = await ac.post("/gateway/models/unload", json={"model": "local"})
     assert resp.status_code == 200
@@ -451,3 +453,67 @@ async def test_startup_event_starts_idle_monitor():
         srv._backend_manager = None
         srv._proxy_manager = None
         srv._task_router = None
+
+
+# ---------------------------------------------------------------------------
+# Test: In-process MLX chat completions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_chat_completions_inprocess_mlx(client):
+    """When LlmManager has model loaded, call generate() directly."""
+    ac, mock_backend, mock_proxy, mock_router = client
+    mock_router.resolve_model.return_value = "local"
+    mock_backend.ensure_model = AsyncMock(return_value=0)  # in-process sentinel
+    mock_backend._llm_manager.is_loaded = MagicMock(return_value=True)
+    mock_backend._llm_manager.generate = AsyncMock(return_value={
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": "test-model",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    })
+
+    resp = await ac.post("/v1/chat/completions", json={
+        "model": "local",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+        "max_tokens": 100,
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["choices"][0]["message"]["content"] == "Hello!"
+    # Proxy should NOT have been called
+    mock_proxy.completion.assert_not_called()
+    # LlmManager.generate was called
+    mock_backend._llm_manager.generate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_inprocess_streaming(client):
+    """Streaming with in-process model yields SSE chunks."""
+    ac, mock_backend, mock_proxy, mock_router = client
+    mock_router.resolve_model.return_value = "local"
+    mock_backend.ensure_model = AsyncMock(return_value=0)
+    mock_backend._llm_manager.is_loaded = MagicMock(return_value=True)
+
+    async def fake_stream(*args, **kwargs):
+        yield {"id": "chatcmpl-x", "object": "chat.completion.chunk", "choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]}
+        yield {"id": "chatcmpl-x", "object": "chat.completion.chunk", "choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+    mock_backend._llm_manager.stream_generate = MagicMock(return_value=fake_stream())
+
+    resp = await ac.post("/v1/chat/completions", json={
+        "model": "local",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+    })
+
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    body = resp.text
+    assert "data:" in body
+    assert "[DONE]" in body
+    mock_proxy.completion.assert_not_called()

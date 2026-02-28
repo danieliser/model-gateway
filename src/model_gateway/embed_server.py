@@ -13,9 +13,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import mlx.core as mx
-
 logger = logging.getLogger(__name__)
+
+# Lazy import — resolved on first use
+mx = None
+
+
+def _ensure_mlx():
+    global mx
+    if mx is None:
+        import mlx.core
+        mx = mlx.core
 
 # ---------------------------------------------------------------------------
 # Loaded model state
@@ -91,6 +99,7 @@ class EmbedManager:
             raise RuntimeError(f"Embedding model '{model_alias}' not loaded")
 
         info.last_used = time.monotonic()
+        _ensure_mlx()
         texts = [input_text] if isinstance(input_text, str) else input_text
 
         encoded = info.tokenizer(

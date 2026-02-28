@@ -15,10 +15,11 @@ import httpx
 
 from model_gateway.config import CLOUD_BACKENDS, BackendConfig, GatewayConfig, ModelConfig, get_log_dir
 from model_gateway.embed_server import EmbedManager
+from model_gateway.llm_server import LlmManager
 
 logger = logging.getLogger(__name__)
 _EXTERNAL_BACKENDS = {"ollama", "lm_studio", "lm-studio"}
-_IN_PROCESS_BACKENDS = {"mlx-embed"}
+_IN_PROCESS_BACKENDS = {"mlx-embed", "mlx"}
 
 
 def _find_vllm_mlx() -> str | None:
@@ -77,6 +78,7 @@ class BackendManager:
         self._start_locks: dict[str, asyncio.Lock] = {}
         self._idle_monitor_task: asyncio.Task | None = None
         self._embed_manager = EmbedManager()
+        self._llm_manager = LlmManager()
 
     def _alloc_port(self) -> int:
         """Allocate the next sequential port."""
@@ -198,21 +200,29 @@ class BackendManager:
         if backend_name in CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
             return 0
 
-        # In-process backends (e.g. mlx-embed) — no subprocess, no port
+        # In-process backends — no subprocess, no port
         if backend_name in _IN_PROCESS_BACKENDS:
-            if not self._embed_manager.is_loaded(model_alias):
+            if backend_name == "mlx-embed":
+                manager = self._embed_manager
+            else:  # "mlx"
+                manager = self._llm_manager
+
+            if not manager.is_loaded(model_alias):
                 model_id = model_cfg.model_id or model_cfg.model_path
                 if not model_id:
                     self._status_errors[model_alias] = "No model_id or model_path"
                     return None
                 try:
-                    self._embed_manager.load(model_alias, model_id)
+                    result = manager.load(model_alias, model_id)
+                    # LlmManager.load() is async, EmbedManager.load() is sync
+                    if asyncio.iscoroutine(result):
+                        await result
                 except Exception as exc:
                     self._status_errors[model_alias] = str(exc)
                     logger.error("Failed to load in-process model %s: %s", model_alias, exc)
                     return None
             else:
-                self._embed_manager.touch(model_alias)
+                manager.touch(model_alias)
             return 0
 
         lock = self._get_start_lock(model_alias)
@@ -321,18 +331,43 @@ class BackendManager:
         return False
 
     def unload_model(self, model_alias: str) -> bool:
-        """Stop a model's process and remove from _running.
+        """Stop a model's process and remove from _running (sync version).
 
         Returns True if unloaded, False if pinned or not running.
+        For async LLM unloads, use unload_model_async() instead.
         """
         model_cfg = self._get_model_cfg(model_alias)
         if model_cfg and model_cfg.pin:
             logger.warning("Model %s is pinned — refusing to unload", model_alias)
             return False
 
-        # In-process models (e.g. mlx-embed)
+        # In-process models
         if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
-            return self._embed_manager.unload(model_alias)
+            if model_cfg.backend == "mlx-embed":
+                return self._embed_manager.unload(model_alias)
+            # "mlx" — schedule async unload, return True optimistically
+            if self._llm_manager.is_loaded(model_alias):
+                asyncio.ensure_future(self._llm_manager.unload(model_alias))
+                return True
+            return False
+
+        if model_alias not in self._running:
+            return False
+
+        self._stop_model_sync(model_alias)
+        return True
+
+    async def unload_model_async(self, model_alias: str) -> bool:
+        """Async version of unload_model — properly awaits LLM engine shutdown."""
+        model_cfg = self._get_model_cfg(model_alias)
+        if model_cfg and model_cfg.pin:
+            logger.warning("Model %s is pinned — refusing to unload", model_alias)
+            return False
+
+        if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
+            if model_cfg.backend == "mlx-embed":
+                return self._embed_manager.unload(model_alias)
+            return await self._llm_manager.unload(model_alias)
 
         if model_alias not in self._running:
             return False
@@ -488,17 +523,27 @@ class BackendManager:
         for alias, model_cfg in self._config.models.items():
             if model_cfg.backend not in _IN_PROCESS_BACKENDS:
                 continue
-            if not self._embed_manager.is_loaded(alias):
-                continue
             if model_cfg.pin:
                 continue
-            last_used = self._embed_manager.get_last_used(alias)
+
+            # Pick the right manager
+            if model_cfg.backend == "mlx-embed":
+                manager = self._embed_manager
+            else:
+                manager = self._llm_manager
+
+            if not manager.is_loaded(alias):
+                continue
+            last_used = manager.get_last_used(alias)
             if last_used is None:
                 continue
             timeout = (model_cfg.idle_timeout if model_cfg.idle_timeout is not None else global_timeout)
             if now - last_used > timeout:
                 logger.info("In-process model %s idle for >%ds — unloading", alias, timeout)
-                self._embed_manager.unload(alias)
+                result = manager.unload(alias)
+                # LlmManager.unload() is async
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
 
     def get_status(self) -> dict[str, BackendStatus]:
         """Return status of all models (loaded and available)."""
@@ -518,16 +563,22 @@ class BackendManager:
             else:
                 self._cleanup_stale(alias)
 
-        # In-process models (e.g. mlx-embed)
+        # In-process models
         for alias, model_cfg in self._config.models.items():
             if alias in result:
                 continue
-            if model_cfg.backend in _IN_PROCESS_BACKENDS and self._embed_manager.is_loaded(alias):
+            if model_cfg.backend not in _IN_PROCESS_BACKENDS:
+                continue
+            if model_cfg.backend == "mlx-embed":
+                manager = self._embed_manager
+            else:
+                manager = self._llm_manager
+            if manager.is_loaded(alias):
                 result[alias] = BackendStatus(
                     name=alias,
                     running=True,
                     model_alias=alias,
-                    last_used=self._embed_manager.get_last_used(alias),
+                    last_used=manager.get_last_used(alias),
                 )
 
         # Configured-but-unloaded models
@@ -568,7 +619,9 @@ class BackendManager:
             return True
         model_cfg = self._get_model_cfg(model_alias)
         if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
-            return self._embed_manager.is_loaded(model_alias)
+            if model_cfg.backend == "mlx-embed":
+                return self._embed_manager.is_loaded(model_alias)
+            return self._llm_manager.is_loaded(model_alias)
         if model_cfg and model_cfg.backend in CLOUD_BACKENDS:
             return True
         return False
@@ -581,6 +634,21 @@ class BackendManager:
     async def cleanup(self) -> None:
         """Stop all running backends. Called on gateway shutdown."""
         self.stop_idle_monitor()
+        # Stop subprocess backends
         aliases = list(self._running.keys())
         for alias in aliases:
             self._stop_model_sync(alias)
+        # Stop in-process LLM engines
+        for alias in list(self._models_to_unload_llm()):
+            await self._llm_manager.unload(alias)
+        # Unload in-process embeddings
+        for alias, cfg in self._config.models.items():
+            if cfg.backend == "mlx-embed" and self._embed_manager.is_loaded(alias):
+                self._embed_manager.unload(alias)
+
+    def _models_to_unload_llm(self) -> list[str]:
+        """Return list of loaded LLM model aliases."""
+        return [
+            alias for alias, cfg in self._config.models.items()
+            if cfg.backend == "mlx" and self._llm_manager.is_loaded(alias)
+        ]

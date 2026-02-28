@@ -97,7 +97,29 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         if model_cfg:
             _proxy_manager.on_model_loaded(resolved_model, model_cfg.backend, port)
 
-    # Call through proxy
+    # In-process MLX chat models — call directly, no HTTP proxy
+    if _backend_manager._llm_manager.is_loaded(resolved_model):
+        body_kwargs = {
+            k: body[k]
+            for k in ("max_tokens", "temperature", "top_p", "repetition_penalty", "stop")
+            if k in body
+        }
+        if stream:
+            async def stream_inprocess():
+                async for chunk in _backend_manager._llm_manager.stream_generate(
+                    resolved_model, messages, **body_kwargs
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(stream_inprocess(), media_type="text/event-stream")
+        else:
+            result = await _backend_manager._llm_manager.generate(
+                resolved_model, messages, **body_kwargs
+            )
+            return JSONResponse(content=result)
+
+    # Call through proxy (cloud, external, llama-cpp)
     result = await _proxy_manager.completion(resolved_model, messages, stream=stream)
 
     # httpx.Response = local pass-through, otherwise LiteLLM ModelResponse
@@ -260,7 +282,7 @@ async def unload_model(request: Request) -> dict:
     if not model_alias or model_alias not in _config.models:
         raise HTTPException(404, f"Unknown model: {model_alias}")
 
-    success = _backend_manager.unload_model(model_alias)
+    success = await _backend_manager.unload_model_async(model_alias)
     if success:
         model_cfg = _config.models[model_alias]
         _proxy_manager.on_model_unloaded(model_alias, model_cfg.backend)
