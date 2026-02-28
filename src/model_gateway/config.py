@@ -13,6 +13,8 @@ class ModelConfig:
     model_id: str | None = None
     model_path: str | None = None
     api_key_env: str | None = None
+    pin: bool = False
+    idle_timeout: int | None = None
 
 
 @dataclass
@@ -27,6 +29,9 @@ class BackendConfig:
 class GatewayConfig:
     port: int = 8800
     default_model: str | None = None
+    embedding_model: str | None = None
+    idle_timeout: int = 900
+    idle_check_interval: int = 30
     models: dict[str, ModelConfig] = field(default_factory=dict)
     backends: dict[str, BackendConfig] = field(default_factory=dict)
     task_routing: dict[str, str] = field(default_factory=dict)
@@ -71,10 +76,12 @@ def _parse_config(path: Path) -> GatewayConfig:
     with open(path) as f:
         data = yaml.safe_load(f) or {}
 
-    models = {
-        name: ModelConfig(**cfg)
-        for name, cfg in (data.get("models") or {}).items()
-    }
+    models = {}
+    for name, cfg in (data.get("models") or {}).items():
+        # Filter to known ModelConfig fields to avoid TypeError on unknown keys
+        known = {"backend", "model_id", "model_path", "api_key_env", "pin", "idle_timeout"}
+        filtered = {k: v for k, v in cfg.items() if k in known}
+        models[name] = ModelConfig(**filtered)
 
     backends = {
         name: BackendConfig(**cfg)
@@ -84,6 +91,9 @@ def _parse_config(path: Path) -> GatewayConfig:
     return GatewayConfig(
         port=data.get("port", 8800),
         default_model=data.get("default_model"),
+        embedding_model=data.get("embedding_model"),
+        idle_timeout=data.get("idle_timeout", 900),
+        idle_check_interval=data.get("idle_check_interval", 30),
         models=models,
         backends=backends,
         task_routing=data.get("task_routing") or {},

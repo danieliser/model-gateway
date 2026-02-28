@@ -1,7 +1,7 @@
 """OpenAI-compatible proxy layer — translates gateway requests to backend calls."""
 
 import logging
-from typing import Any, AsyncGenerator
+from typing import Any, Awaitable, Callable
 
 import httpx
 import litellm
@@ -13,11 +13,16 @@ logger = logging.getLogger(__name__)
 
 
 class ProxyManager:
-    def __init__(self, config: GatewayConfig):
+    def __init__(
+        self,
+        config: GatewayConfig,
+        ensure_model_fn: Callable[[str], Awaitable[int | None]] | None = None,
+    ):
         self._config = config
-        self._backend_urls: dict[str, str] = {}
+        self._backend_urls: dict[str, str] = {}  # keyed by backend name or model alias
         self._router: Router | None = None
         self._http_client: httpx.AsyncClient | None = None
+        self._ensure_model_fn = ensure_model_fn
 
     def setup(self, backend_ports: dict[str, int]) -> None:
         """Configure LiteLLM Router with model aliases from our config."""
@@ -35,9 +40,42 @@ class ProxyManager:
         else:
             logger.warning("No models configured for LiteLLM Router")
 
-        # Shared httpx client for local pass-through (connection pooling)
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=120.0)
+
+    def on_model_loaded(self, model_alias: str, backend_name: str, port: int) -> None:
+        """Register a newly loaded model's port and rebuild router entry."""
+        url = f"http://localhost:{port}/v1"
+        self._backend_urls[model_alias] = url
+        # Also register under backend name for backwards compat
+        self._backend_urls[backend_name] = url
+
+        # Rebuild router to include the new model
+        model_cfg = self._config.models.get(model_alias)
+        if model_cfg:
+            entry = self._build_model_entry(model_alias, model_cfg)
+            if entry:
+                current = self._router.model_list if self._router else []
+                # Remove existing entry for this alias, add updated one
+                filtered = [e for e in current if e.get("model_name") != model_alias]
+                filtered.append(entry)
+                self._router = Router(model_list=filtered)
+
+    def on_model_unloaded(self, model_alias: str, backend_name: str) -> None:
+        """Remove a model's URL entry after unload."""
+        self._backend_urls.pop(model_alias, None)
+        # Only remove backend URL if no other model is using it
+        # (another model on the same backend type may still be running)
+
+        if self._router:
+            filtered = [
+                e for e in self._router.model_list
+                if e.get("model_name") != model_alias
+            ]
+            if filtered:
+                self._router = Router(model_list=filtered)
+            else:
+                self._router = None
 
     def _build_model_entry(self, alias: str, model_cfg: Any) -> dict | None:
         """Build a single LiteLLM model_list entry."""
@@ -71,10 +109,10 @@ class ProxyManager:
                 },
             }
 
-        # Local backend — must have a port registered
-        api_base = self._backend_urls.get(backend)
+        # Local backend — check model alias first, then backend name
+        api_base = self._backend_urls.get(alias) or self._backend_urls.get(backend)
         if api_base is None:
-            logger.warning("No port registered for local backend '%s', skipping model '%s'", backend, alias)
+            logger.warning("No port registered for model '%s' (backend '%s'), skipping", alias, backend)
             return None
 
         model_id = model_cfg.model_id or alias
@@ -87,12 +125,14 @@ class ProxyManager:
             },
         }
 
+    def register_external_url(self, backend_name: str, url: str) -> None:
+        """Register a URL for an external backend (lm-studio, ollama, etc.)."""
+        self._backend_urls[backend_name] = url
+
     def update_backend_url(self, backend_name: str, port: int) -> None:
         """Update URL for a local backend (called after model switch/restart)."""
         new_url = f"http://localhost:{port}/v1"
         self._backend_urls[backend_name] = new_url
-
-        # Re-setup router with updated URLs
         self.setup({backend_name: port})
 
     def _is_local_model(self, model: str) -> tuple[bool, str | None]:
@@ -102,7 +142,8 @@ class ProxyManager:
             return False, None
         if model_cfg.backend in CLOUD_BACKENDS:
             return False, None
-        api_base = self._backend_urls.get(model_cfg.backend)
+        # Check model alias first, then backend name
+        api_base = self._backend_urls.get(model) or self._backend_urls.get(model_cfg.backend)
         return api_base is not None, api_base
 
     async def completion(
@@ -156,6 +197,28 @@ class ProxyManager:
         else:
             return await self._http_client.post(url, json=payload)
 
+    async def embedding(
+        self,
+        model: str,
+        input_text: str | list[str],
+    ) -> Any:
+        """Route an embedding request — pass-through for local, LiteLLM for cloud."""
+        is_local, api_base = self._is_local_model(model)
+        model_cfg = self._config.models.get(model)
+        model_id = (model_cfg.model_id if model_cfg else model) or model
+
+        if is_local and api_base and self._http_client:
+            url = f"{api_base}/embeddings"
+            return await self._http_client.post(
+                url, json={"model": model_id, "input": input_text}
+            )
+
+        # Cloud backends go through LiteLLM Router
+        if self._router is None:
+            raise RuntimeError("ProxyManager not initialized — call setup() first")
+
+        return await self._router.aembedding(model=model, input=input_text)
+
     async def close(self) -> None:
         """Close the httpx client."""
         if self._http_client:
@@ -173,6 +236,6 @@ class ProxyManager:
                 "model_id": model_cfg.model_id,
             }
             if backend not in CLOUD_BACKENDS:
-                info["api_base"] = self._backend_urls.get(backend)
+                info["api_base"] = self._backend_urls.get(alias) or self._backend_urls.get(backend)
             result.append(info)
         return result

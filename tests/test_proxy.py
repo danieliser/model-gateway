@@ -58,6 +58,18 @@ def test_build_entry_local_backend():
     assert params["api_key"] == "not-needed"
 
 
+def test_build_entry_local_backend_by_model_alias():
+    """Model alias key should also work for URL lookup."""
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["local"] = "http://localhost:8801/v1"
+
+    entry = proxy._build_model_entry("local", config.models["local"])
+    assert entry is not None
+    params = entry["litellm_params"]
+    assert params["api_base"] == "http://localhost:8801/v1"
+
+
 # ---------------------------------------------------------------------------
 # Test 2: _build_model_entry for Anthropic
 # ---------------------------------------------------------------------------
@@ -211,7 +223,6 @@ async def test_completion_raises_without_setup():
     config = _make_config()
     proxy = ProxyManager(config)
 
-    # Cloud model with no router set up should raise
     with pytest.raises(RuntimeError, match="not initialized"):
         await proxy.completion("haiku", [{"role": "user", "content": "hi"}])
 
@@ -222,7 +233,6 @@ async def test_completion_raises_without_setup():
 
 @pytest.mark.asyncio
 async def test_local_passthrough_bypasses_litellm():
-    """Local backend completion should use httpx directly, not LiteLLM Router."""
     with patch("model_gateway.proxy.Router") as MockRouter:
         mock_router = MagicMock()
         mock_router.acompletion = AsyncMock()
@@ -232,7 +242,6 @@ async def test_local_passthrough_bypasses_litellm():
         proxy = ProxyManager(config)
         proxy.setup({"mlx": 8801})
 
-        # Mock the httpx client
         mock_response = MagicMock()
         mock_response.json.return_value = {"choices": [{"message": {"content": "hi"}}]}
         mock_http = AsyncMock()
@@ -242,9 +251,7 @@ async def test_local_passthrough_bypasses_litellm():
         messages = [{"role": "user", "content": "Hello"}]
         result = await proxy.completion("local", messages, stream=False)
 
-        # LiteLLM should NOT be called
         mock_router.acompletion.assert_not_called()
-        # httpx should be called with the backend URL
         mock_http.post.assert_called_once()
         call_url = mock_http.post.call_args[0][0]
         assert "localhost:8801" in call_url
@@ -266,3 +273,106 @@ async def test_is_local_model():
 
     is_local, api_base = proxy._is_local_model("nonexistent")
     assert is_local is False
+
+
+@pytest.mark.asyncio
+async def test_is_local_model_by_alias_key():
+    """Model alias key in _backend_urls should also work."""
+    config = _make_config()
+    proxy = ProxyManager(config)
+    proxy._backend_urls["local"] = "http://localhost:8801/v1"
+
+    is_local, api_base = proxy._is_local_model("local")
+    assert is_local is True
+    assert api_base == "http://localhost:8801/v1"
+
+
+# ---------------------------------------------------------------------------
+# Test: on_model_loaded / on_model_unloaded
+# ---------------------------------------------------------------------------
+
+def test_on_model_loaded_registers_url():
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        MockRouter.return_value = MagicMock()
+        config = _make_config()
+        proxy = ProxyManager(config)
+        proxy.setup({})
+
+        proxy.on_model_loaded("local", "mlx", 8801)
+        assert proxy._backend_urls["local"] == "http://localhost:8801/v1"
+        assert proxy._backend_urls["mlx"] == "http://localhost:8801/v1"
+
+
+def test_on_model_unloaded_removes_url():
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        MockRouter.return_value = MagicMock()
+        MockRouter.return_value.model_list = []
+        config = _make_config()
+        proxy = ProxyManager(config)
+        proxy.setup({})
+
+        proxy._backend_urls["local"] = "http://localhost:8801/v1"
+        proxy.on_model_unloaded("local", "mlx")
+        assert "local" not in proxy._backend_urls
+
+
+# ---------------------------------------------------------------------------
+# Test: embedding() routes to local backend
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_embedding_local_passthrough():
+    with patch("model_gateway.proxy.Router"):
+        config = _make_config()
+        proxy = ProxyManager(config)
+        proxy.setup({"mlx": 8801})
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "data": [{"embedding": [0.1, 0.2]}],
+        }
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_response)
+        proxy._http_client = mock_http
+
+        result = await proxy.embedding("local", "hello")
+
+        mock_http.post.assert_called_once()
+        call_url = mock_http.post.call_args[0][0]
+        assert "localhost:8801" in call_url
+        assert "/embeddings" in call_url
+        assert result is mock_response
+
+
+@pytest.mark.asyncio
+async def test_embedding_cloud_uses_litellm():
+    with patch("model_gateway.proxy.Router") as MockRouter:
+        mock_router = MagicMock()
+        fake_response = MagicMock()
+        mock_router.aembedding = AsyncMock(return_value=fake_response)
+        MockRouter.return_value = mock_router
+
+        config = _make_config()
+        proxy = ProxyManager(config)
+        proxy.setup({"mlx": 8801})
+
+        result = await proxy.embedding("haiku", "hello")
+
+        mock_router.aembedding.assert_called_once_with(
+            model="haiku", input="hello"
+        )
+        assert result is fake_response
+
+
+# ---------------------------------------------------------------------------
+# Test: ensure_model_fn callback
+# ---------------------------------------------------------------------------
+
+def test_ensure_model_fn_accepted():
+    """ProxyManager accepts an ensure_model_fn callback."""
+    async def fake_ensure(model: str) -> int | None:
+        return 8801
+
+    config = _make_config()
+    proxy = ProxyManager(config, ensure_model_fn=fake_ensure)
+    assert proxy._ensure_model_fn is fake_ensure

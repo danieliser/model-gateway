@@ -93,6 +93,8 @@ def test_empty_config_gets_defaults(tmp_path):
     assert config.backends == {}
     assert config.task_routing == {}
     assert config.fallback_chain == []
+    assert config.idle_timeout == 900
+    assert config.idle_check_interval == 30
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +232,76 @@ def test_validate_local_model_with_model_id_ok():
     )
     errors = validate_config(config)
     assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# Test: embedding_model is parsed from config
+# ---------------------------------------------------------------------------
+
+def test_load_config_with_embedding_model(tmp_path):
+    data = {
+        **MINIMAL_VALID_DATA,
+        "embedding_model": "nomic-embed",
+    }
+    data["models"]["nomic-embed"] = {
+        "backend": "mlx",
+        "model_id": "nomic-embed-v1.5",
+    }
+    config_file = _write_yaml(tmp_path / "config.yml", data)
+    config = load_config(str(config_file))
+    assert config.embedding_model == "nomic-embed"
+    assert "nomic-embed" in config.models
+
+
+def test_load_config_without_embedding_model(tmp_path):
+    config_file = _write_yaml(tmp_path / "config.yml", MINIMAL_VALID_DATA)
+    config = load_config(str(config_file))
+    assert config.embedding_model is None
+
+
+# ---------------------------------------------------------------------------
+# Test: New config fields — pin, idle_timeout, idle_check_interval
+# ---------------------------------------------------------------------------
+
+def test_model_config_pin_default():
+    m = ModelConfig(backend="mlx", model_id="test")
+    assert m.pin is False
+    assert m.idle_timeout is None
+
+
+def test_model_config_pin_set():
+    m = ModelConfig(backend="mlx", model_id="test", pin=True, idle_timeout=300)
+    assert m.pin is True
+    assert m.idle_timeout == 300
+
+
+def test_gateway_config_idle_defaults():
+    g = GatewayConfig()
+    assert g.idle_timeout == 900
+    assert g.idle_check_interval == 30
+
+
+def test_load_config_with_idle_fields(tmp_path):
+    import copy
+    data = copy.deepcopy(MINIMAL_VALID_DATA)
+    data["idle_timeout"] = 600
+    data["idle_check_interval"] = 15
+    data["models"]["local"]["pin"] = True
+    data["models"]["local"]["idle_timeout"] = 300
+    config_file = _write_yaml(tmp_path / "config.yml", data)
+    config = load_config(str(config_file))
+
+    assert config.idle_timeout == 600
+    assert config.idle_check_interval == 15
+    assert config.models["local"].pin is True
+    assert config.models["local"].idle_timeout == 300
+
+
+def test_load_config_idle_fields_default_when_omitted(tmp_path):
+    config_file = _write_yaml(tmp_path / "config.yml", MINIMAL_VALID_DATA)
+    config = load_config(str(config_file))
+
+    assert config.idle_timeout == 900
+    assert config.idle_check_interval == 30
+    assert config.models["local"].pin is False
+    assert config.models["local"].idle_timeout is None

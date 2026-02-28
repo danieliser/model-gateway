@@ -9,21 +9,35 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
 from model_gateway.config import CLOUD_BACKENDS, BackendConfig, GatewayConfig, ModelConfig, get_log_dir
+from model_gateway.embed_server import EmbedManager
 
 logger = logging.getLogger(__name__)
 _EXTERNAL_BACKENDS = {"ollama", "lm_studio", "lm-studio"}
+_IN_PROCESS_BACKENDS = {"mlx-embed"}
+
+
+def _find_vllm_mlx() -> str | None:
+    """Find vllm-mlx binary — check PATH first, then sibling of sys.executable."""
+    found = shutil.which("vllm-mlx")
+    if found:
+        return found
+    # When running as a daemon, PATH may not include the venv bin dir
+    venv_bin = os.path.join(os.path.dirname(sys.executable), "vllm-mlx")
+    if os.path.isfile(venv_bin) and os.access(venv_bin, os.X_OK):
+        return venv_bin
+    return None
 
 
 def _is_mlx_available() -> bool:
     """Check macOS + arm64 + vllm-mlx binary available."""
     if sys.platform != "darwin" or platform.machine() != "arm64":
         return False
-    return shutil.which("vllm-mlx") is not None
+    return _find_vllm_mlx() is not None
 
 
 def _is_binary_available(name: str) -> bool:
@@ -38,6 +52,7 @@ class BackendStatus:
     port: int | None = None
     pid: int | None = None
     model_alias: str | None = None
+    last_used: float | None = None
     error: str | None = None
 
 
@@ -47,20 +62,37 @@ class _RunningBackend:
     port: int
     pid: int
     model: str
+    backend_name: str
     log_file: object  # file handle
+    last_used: float = field(default_factory=time.monotonic)
 
 
 class BackendManager:
     def __init__(self, config: GatewayConfig):
         self._config = config
+        # Keyed by model alias (not backend name)
         self._running: dict[str, _RunningBackend] = {}
         self._status_errors: dict[str, str] = {}
-        self._next_port: int = 8801
+        self._next_port: int = config.port + 1
+        self._start_locks: dict[str, asyncio.Lock] = {}
+        self._idle_monitor_task: asyncio.Task | None = None
+        self._embed_manager = EmbedManager()
 
     def _alloc_port(self) -> int:
+        """Allocate the next sequential port."""
         port = self._next_port
         self._next_port += 1
         return port
+
+    @staticmethod
+    def _is_port_free(port: int) -> bool:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
 
     def _get_backend_cfg(self, backend_name: str) -> BackendConfig | None:
         return self._config.backends.get(backend_name)
@@ -68,21 +100,27 @@ class BackendManager:
     def _get_model_cfg(self, model_alias: str) -> ModelConfig | None:
         return self._config.models.get(model_alias)
 
+    def _get_start_lock(self, model_alias: str) -> asyncio.Lock:
+        if model_alias not in self._start_locks:
+            self._start_locks[model_alias] = asyncio.Lock()
+        return self._start_locks[model_alias]
+
     def _is_model_cached(self, model_id: str) -> bool:
-        """Check if a HuggingFace model is already downloaded locally."""
+        """Check if a model is available locally (HF cache or local path)."""
+        expanded = os.path.expanduser(model_id)
+        if os.path.isdir(expanded) and os.path.isfile(os.path.join(expanded, "config.json")):
+            return True
         try:
             from huggingface_hub import try_to_load_from_cache
-            # Check for config.json as a proxy — every model has one
             result = try_to_load_from_cache(model_id, "config.json")
             return result is not None and isinstance(result, str)
         except ImportError:
-            # If huggingface_hub isn't available, assume not cached
             return False
         except Exception:
             return False
 
     def _build_command(
-        self, backend_name: str, model_cfg: ModelConfig, port: int
+        self, backend_name: str, model_alias: str, model_cfg: ModelConfig, port: int
     ) -> list[str] | None:
         """Build the startup command for a local backend."""
         if backend_name == "mlx":
@@ -91,17 +129,22 @@ class BackendManager:
                 return None
             if not self._is_model_cached(model_id):
                 logger.warning(
-                    "Model '%s' not found locally. Download it first with: "
+                    "Model '%s' (%s) not found locally. Download it first with: "
                     "huggingface-cli download %s",
-                    model_id, model_id,
+                    model_alias, model_id, model_id,
                 )
-                self._status_errors[backend_name] = f"Model '{model_id}' not downloaded"
+                self._status_errors[model_alias] = f"Model '{model_id}' not downloaded"
                 return None
-            return [
-                "vllm-mlx", "serve", model_id,
+            vllm_bin = _find_vllm_mlx()
+            if not vllm_bin:
+                self._status_errors[model_alias] = "vllm-mlx binary not found"
+                return None
+            cmd = [
+                vllm_bin, "serve", model_id,
                 "--port", str(port),
                 "--continuous-batching",
             ]
+            return cmd
         elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
             model_path = model_cfg.model_path or model_cfg.model_id
             if not model_path:
@@ -113,7 +156,7 @@ class BackendManager:
 
     def _health_url(self, backend_name: str, port: int | None, backend_cfg: BackendConfig | None) -> str:
         """Return the health check URL for a backend."""
-        if backend_name == "mlx":
+        if backend_name in ("mlx", "mlx-embed"):
             return f"http://localhost:{port}/health"
         elif backend_name in ("llama.cpp", "llama-cpp", "llamacpp"):
             return f"http://localhost:{port}/health"
@@ -125,96 +168,148 @@ class BackendManager:
             return f"{host}/v1/models"
         return ""
 
-    def _is_process_alive(self, backend_name: str) -> bool:
-        """Check if the backend's process is still running."""
-        info = self._running.get(backend_name)
+    def _is_process_alive(self, model_alias: str) -> bool:
+        """Check if the model's process is still running."""
+        info = self._running.get(model_alias)
         if info is None:
             return False
         return info.process.poll() is None
 
-    async def start_backend(self, backend_name: str, model_alias: str) -> bool:
-        """Start a local backend server for the given model. Returns True if started successfully."""
-        if backend_name in self._running:
-            if self._is_process_alive(backend_name):
-                logger.debug("Backend %s already running", backend_name)
-                return True
-            # Process died — clean up stale entry
-            self._cleanup_stale(backend_name)
+    async def ensure_model(self, model_alias: str) -> int | None:
+        """Ensure a model is loaded. Returns port if loaded, None on failure.
 
-        backend_cfg = self._get_backend_cfg(backend_name)
+        This is the main entry point for lazy loading. If the model is already
+        running, touches last_used and returns the port. Otherwise acquires a
+        per-model lock to prevent duplicate starts.
+        """
+        # Fast path: already running and alive
+        if model_alias in self._running and self._is_process_alive(model_alias):
+            self._running[model_alias].last_used = time.monotonic()
+            return self._running[model_alias].port
+
         model_cfg = self._get_model_cfg(model_alias)
-
         if model_cfg is None:
-            self._status_errors[backend_name] = f"Unknown model alias: {model_alias}"
-            return False
+            self._status_errors[model_alias] = f"Unknown model alias: {model_alias}"
+            return None
 
-        # External / cloud backends don't need subprocess
+        backend_name = model_cfg.backend
+
+        # Cloud / external backends don't have ports — return 0 as sentinel
         if backend_name in CLOUD_BACKENDS or backend_name in _EXTERNAL_BACKENDS:
-            return True
+            return 0
 
-        cmd = self._build_command(backend_name, model_cfg, self._alloc_port())
+        # In-process backends (e.g. mlx-embed) — no subprocess, no port
+        if backend_name in _IN_PROCESS_BACKENDS:
+            if not self._embed_manager.is_loaded(model_alias):
+                model_id = model_cfg.model_id or model_cfg.model_path
+                if not model_id:
+                    self._status_errors[model_alias] = "No model_id or model_path"
+                    return None
+                try:
+                    self._embed_manager.load(model_alias, model_id)
+                except Exception as exc:
+                    self._status_errors[model_alias] = str(exc)
+                    logger.error("Failed to load in-process model %s: %s", model_alias, exc)
+                    return None
+            else:
+                self._embed_manager.touch(model_alias)
+            return 0
+
+        lock = self._get_start_lock(model_alias)
+        async with lock:
+            # Double-check after acquiring lock
+            if model_alias in self._running and self._is_process_alive(model_alias):
+                self._running[model_alias].last_used = time.monotonic()
+                return self._running[model_alias].port
+
+            # Clean up stale entry if present
+            if model_alias in self._running:
+                self._cleanup_stale(model_alias)
+
+            started = await self._start_model(model_alias, backend_name, model_cfg)
+            if started:
+                return self._running[model_alias].port
+            return None
+
+    async def _start_model(
+        self, model_alias: str, backend_name: str, model_cfg: ModelConfig
+    ) -> bool:
+        """Start a local backend process for the given model."""
+        backend_cfg = self._get_backend_cfg(backend_name)
+        port = self._alloc_port()
+        cmd = self._build_command(backend_name, model_alias, model_cfg, port)
         if cmd is None:
-            self._status_errors[backend_name] = f"Cannot build command for backend '{backend_name}'"
+            self._status_errors[model_alias] = f"Cannot build command for model '{model_alias}'"
             return False
 
-        log_path = get_log_dir() / f"{backend_name}.log"
+        log_path = get_log_dir() / f"{model_alias}.log"
 
         for attempt in range(3):
-            port = self._running[backend_name].port if backend_name in self._running else self._next_port - 1
             try:
                 log_file = open(log_path, "ab")
-                # Use subprocess.Popen with start_new_session to fully detach
-                # from uvicorn's process group and signal handling.
                 process = subprocess.Popen(
                     cmd,
                     stdout=log_file,
                     stderr=log_file,
                     start_new_session=True,
                 )
-                self._running[backend_name] = _RunningBackend(
+                self._running[model_alias] = _RunningBackend(
                     process=process,
                     port=port,
                     pid=process.pid,
                     model=model_alias,
+                    backend_name=backend_name,
                     log_file=log_file,
+                    last_used=time.monotonic(),
                 )
-                self._status_errors.pop(backend_name, None)
+                self._status_errors.pop(model_alias, None)
 
-                # Wait for health
-                if await self._wait_for_health(backend_name, port, backend_cfg):
-                    logger.info("Backend %s started (pid=%d, port=%d)", backend_name, process.pid, port)
+                if await self._wait_for_health(model_alias, backend_name, port, backend_cfg):
+                    logger.info(
+                        "Model %s started on %s (pid=%d, port=%d)",
+                        model_alias, backend_name, process.pid, port,
+                    )
                     return True
 
-                # Check if process crashed vs just slow
                 if process.poll() is not None:
-                    logger.warning("Backend %s process exited (code=%s, attempt %d/3)", backend_name, process.returncode, attempt + 1)
+                    logger.warning(
+                        "Model %s process exited (code=%s, attempt %d/3)",
+                        model_alias, process.returncode, attempt + 1,
+                    )
                 else:
-                    logger.warning("Backend %s health check timed out (attempt %d/3)", backend_name, attempt + 1)
+                    logger.warning(
+                        "Model %s health check timed out (attempt %d/3)",
+                        model_alias, attempt + 1,
+                    )
 
-                self._stop_backend_sync(backend_name)
-
-                # Wait for port release before retry
+                self._stop_model_sync(model_alias)
                 await asyncio.sleep(2.0)
 
             except Exception as exc:
-                logger.error("Error starting backend %s: %s", backend_name, exc)
-                self._status_errors[backend_name] = str(exc)
-                self._running.pop(backend_name, None)
+                logger.error("Error starting model %s: %s", model_alias, exc)
+                self._status_errors[model_alias] = str(exc)
+                self._running.pop(model_alias, None)
 
-        self._status_errors[backend_name] = f"Backend '{backend_name}' failed after 3 attempts"
+        self._status_errors[model_alias] = f"Model '{model_alias}' failed after 3 attempts"
         return False
 
+    # Legacy compat — delegates to ensure_model
+    async def start_backend(self, backend_name: str, model_alias: str) -> bool:
+        """Start a local backend server for the given model. Returns True if started successfully."""
+        port = await self.ensure_model(model_alias)
+        return port is not None
+
     async def _wait_for_health(
-        self, backend_name: str, port: int, backend_cfg: BackendConfig | None, timeout: float = 120.0
+        self, model_alias: str, backend_name: str, port: int,
+        backend_cfg: BackendConfig | None, timeout: float = 120.0,
     ) -> bool:
         url = self._health_url(backend_name, port, backend_cfg)
         if not url:
-            return True  # no health check available
+            return True
         deadline = time.monotonic() + timeout
         async with httpx.AsyncClient() as client:
             while time.monotonic() < deadline:
-                # Check if process died while we're waiting
-                if not self._is_process_alive(backend_name):
+                if not self._is_process_alive(model_alias):
                     return False
                 try:
                     resp = await client.get(url, timeout=2.0)
@@ -225,18 +320,38 @@ class BackendManager:
                 await asyncio.sleep(2.0)
         return False
 
-    def _cleanup_stale(self, backend_name: str) -> None:
+    def unload_model(self, model_alias: str) -> bool:
+        """Stop a model's process and remove from _running.
+
+        Returns True if unloaded, False if pinned or not running.
+        """
+        model_cfg = self._get_model_cfg(model_alias)
+        if model_cfg and model_cfg.pin:
+            logger.warning("Model %s is pinned — refusing to unload", model_alias)
+            return False
+
+        # In-process models (e.g. mlx-embed)
+        if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
+            return self._embed_manager.unload(model_alias)
+
+        if model_alias not in self._running:
+            return False
+
+        self._stop_model_sync(model_alias)
+        return True
+
+    def _cleanup_stale(self, model_alias: str) -> None:
         """Remove a stale entry for a dead process."""
-        info = self._running.pop(backend_name, None)
+        info = self._running.pop(model_alias, None)
         if info:
             try:
                 info.log_file.close()
             except Exception:
                 pass
 
-    def _stop_backend_sync(self, backend_name: str) -> None:
-        """Stop a backend process synchronously."""
-        info = self._running.pop(backend_name, None)
+    def _stop_model_sync(self, model_alias: str) -> None:
+        """Stop a model's process synchronously."""
+        info = self._running.pop(model_alias, None)
         if info is None:
             return
 
@@ -261,11 +376,24 @@ class BackendManager:
         except Exception:
             pass
 
-        logger.info("Backend %s stopped", backend_name)
+        logger.info("Model %s stopped", model_alias)
+
+    # Legacy compat names
+    def _stop_backend_sync(self, backend_name: str) -> None:
+        """Legacy: stop by backend name. Finds the model alias and delegates."""
+        # Find model alias running on this backend
+        for alias, info in list(self._running.items()):
+            if info.backend_name == backend_name:
+                self._stop_model_sync(alias)
+                return
 
     async def stop_backend(self, backend_name: str) -> None:
         """Graceful shutdown: SIGTERM, wait 5s, SIGKILL if needed."""
         self._stop_backend_sync(backend_name)
+
+    async def stop_model(self, model_alias: str) -> None:
+        """Async wrapper for stopping a model by alias."""
+        self._stop_model_sync(model_alias)
 
     async def health_check(self, backend_name: str) -> bool:
         """HTTP health probe to local server. Returns True if healthy."""
@@ -277,13 +405,17 @@ class BackendManager:
                 return os.environ.get(backend_cfg.api_key_env) is not None
             return False
 
-        # Running subprocess backends
+        # Find a running model on this backend
         port = None
-        if backend_name in self._running:
-            if not self._is_process_alive(backend_name):
-                self._cleanup_stale(backend_name)
-                return False
-            port = self._running[backend_name].port
+        model_alias = None
+        for alias, info in self._running.items():
+            if info.backend_name == backend_name:
+                model_alias = alias
+                if not self._is_process_alive(alias):
+                    self._cleanup_stale(alias)
+                    return False
+                port = info.port
+                break
 
         url = self._health_url(backend_name, port, backend_cfg)
         if not url:
@@ -296,40 +428,159 @@ class BackendManager:
         except Exception:
             return False
 
-    async def switch_model(self, backend_name: str, model_alias: str) -> bool:
-        """Stop current model on backend, start new one. Returns True on success."""
-        await self.stop_backend(backend_name)
-        return await self.start_backend(backend_name, model_alias)
+    async def switch_model(self, old_model: str, new_model: str) -> bool:
+        """Unload old model, load new one. Returns True on success."""
+        self.unload_model(old_model)
+        port = await self.ensure_model(new_model)
+        return port is not None
+
+    # --- Idle monitor ---
+
+    def start_idle_monitor(self) -> None:
+        """Launch the background idle sweep task."""
+        if self._idle_monitor_task is not None:
+            return
+        self._idle_monitor_task = asyncio.create_task(self._idle_sweep_loop())
+
+    def stop_idle_monitor(self) -> None:
+        """Cancel the idle monitor task."""
+        if self._idle_monitor_task is not None:
+            self._idle_monitor_task.cancel()
+            self._idle_monitor_task = None
+
+    async def _idle_sweep_loop(self) -> None:
+        """Background loop that periodically unloads idle models."""
+        interval = self._config.idle_check_interval
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                self._idle_sweep()
+        except asyncio.CancelledError:
+            pass
+
+    def _idle_sweep(self) -> None:
+        """Walk _running, unload models that have been idle past their timeout."""
+        now = time.monotonic()
+        global_timeout = self._config.idle_timeout
+
+        for alias in list(self._running.keys()):
+            info = self._running.get(alias)
+            if info is None:
+                continue
+
+            # Clean up dead processes
+            if not self._is_process_alive(alias):
+                self._cleanup_stale(alias)
+                continue
+
+            # Check pin
+            model_cfg = self._get_model_cfg(alias)
+            if model_cfg and model_cfg.pin:
+                continue
+
+            # Per-model timeout overrides global
+            timeout = (model_cfg.idle_timeout if model_cfg and model_cfg.idle_timeout is not None else global_timeout)
+            if now - info.last_used > timeout:
+                logger.info("Model %s idle for >%ds — unloading", alias, timeout)
+                self._stop_model_sync(alias)
+
+        # In-process models
+        for alias, model_cfg in self._config.models.items():
+            if model_cfg.backend not in _IN_PROCESS_BACKENDS:
+                continue
+            if not self._embed_manager.is_loaded(alias):
+                continue
+            if model_cfg.pin:
+                continue
+            last_used = self._embed_manager.get_last_used(alias)
+            if last_used is None:
+                continue
+            timeout = (model_cfg.idle_timeout if model_cfg.idle_timeout is not None else global_timeout)
+            if now - last_used > timeout:
+                logger.info("In-process model %s idle for >%ds — unloading", alias, timeout)
+                self._embed_manager.unload(alias)
 
     def get_status(self) -> dict[str, BackendStatus]:
-        """Return status of all backends."""
+        """Return status of all models (loaded and available)."""
         result: dict[str, BackendStatus] = {}
 
-        for name, info in list(self._running.items()):
-            if self._is_process_alive(name):
-                result[name] = BackendStatus(
-                    name=name,
+        # Running models
+        for alias, info in list(self._running.items()):
+            if self._is_process_alive(alias):
+                result[alias] = BackendStatus(
+                    name=alias,
                     running=True,
                     port=info.port,
                     pid=info.pid,
-                    model_alias=info.model,
+                    model_alias=alias,
+                    last_used=info.last_used,
                 )
             else:
-                self._cleanup_stale(name)
+                self._cleanup_stale(alias)
 
-        for name in self._config.backends:
-            if name not in result:
-                error = self._status_errors.get(name)
-                result[name] = BackendStatus(
-                    name=name,
-                    running=False,
-                    error=error,
+        # In-process models (e.g. mlx-embed)
+        for alias, model_cfg in self._config.models.items():
+            if alias in result:
+                continue
+            if model_cfg.backend in _IN_PROCESS_BACKENDS and self._embed_manager.is_loaded(alias):
+                result[alias] = BackendStatus(
+                    name=alias,
+                    running=True,
+                    model_alias=alias,
+                    last_used=self._embed_manager.get_last_used(alias),
                 )
+
+        # Configured-but-unloaded models
+        for alias, model_cfg in self._config.models.items():
+            if alias in result:
+                continue
+            backend_name = model_cfg.backend
+            # External backends — assume running if enabled with host
+            if backend_name in _EXTERNAL_BACKENDS:
+                cfg = self._config.backends.get(backend_name)
+                if cfg and cfg.enabled and cfg.host:
+                    result[alias] = BackendStatus(name=alias, running=True, model_alias=alias)
+                    continue
+            # Cloud backends — always available
+            if backend_name in CLOUD_BACKENDS:
+                result[alias] = BackendStatus(name=alias, running=True, model_alias=alias)
+                continue
+            error = self._status_errors.get(alias)
+            result[alias] = BackendStatus(
+                name=alias,
+                running=False,
+                model_alias=alias,
+                error=error,
+            )
 
         return result
 
+    def get_port(self, model_alias: str) -> int | None:
+        """Return the port for a running model, or None if not loaded."""
+        info = self._running.get(model_alias)
+        if info and self._is_process_alive(model_alias):
+            return info.port
+        return None
+
+    def is_model_loaded(self, model_alias: str) -> bool:
+        """Check if a model is loaded (subprocess or in-process)."""
+        if self.get_port(model_alias) is not None:
+            return True
+        model_cfg = self._get_model_cfg(model_alias)
+        if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
+            return self._embed_manager.is_loaded(model_alias)
+        if model_cfg and model_cfg.backend in CLOUD_BACKENDS:
+            return True
+        return False
+
+    def get_backend_name(self, model_alias: str) -> str | None:
+        """Return the backend name for a model alias from config."""
+        model_cfg = self._get_model_cfg(model_alias)
+        return model_cfg.backend if model_cfg else None
+
     async def cleanup(self) -> None:
         """Stop all running backends. Called on gateway shutdown."""
-        names = list(self._running.keys())
-        for name in names:
-            await self.stop_backend(name)
+        self.stop_idle_monitor()
+        aliases = list(self._running.keys())
+        for alias in aliases:
+            self._stop_model_sync(alias)

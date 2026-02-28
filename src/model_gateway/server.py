@@ -1,6 +1,7 @@
 """FastAPI/uvicorn server setup and lifecycle management for the gateway."""
 
 import json
+import logging
 import subprocess
 import time
 from typing import Any
@@ -11,11 +12,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from model_gateway.backends import BackendManager
-from model_gateway.config import GatewayConfig, load_config, validate_config
+from model_gateway.config import CLOUD_BACKENDS, GatewayConfig, load_config, validate_config
 from model_gateway.proxy import ProxyManager
 from model_gateway.routing import TaskRouter
 
-app = FastAPI(title="Model Gateway", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Model Gateway", version="0.2.0")
 
 # Global state (initialized on startup)
 _config: GatewayConfig | None = None
@@ -26,7 +29,7 @@ _task_router: TaskRouter | None = None
 
 @app.on_event("startup")
 async def startup() -> None:
-    """Load config, init managers, start default backend."""
+    """Load config, init managers. No models loaded — everything is lazy."""
     global _config, _backend_manager, _proxy_manager, _task_router
 
     _config = load_config()
@@ -35,31 +38,25 @@ async def startup() -> None:
         raise RuntimeError(f"Config errors: {errors}")
 
     _backend_manager = BackendManager(_config)
-    _proxy_manager = ProxyManager(_config)
+    _proxy_manager = ProxyManager(_config, ensure_model_fn=_backend_manager.ensure_model)
     _task_router = TaskRouter(_config)
 
-    # Start default model's backend if local
-    if _config.default_model and _config.default_model in _config.models:
-        model = _config.models[_config.default_model]
-        if model.backend not in ("anthropic", "openai"):
-            started = await _backend_manager.start_backend(model.backend, _config.default_model)
-            if started:
-                port = _backend_manager.get_status()[model.backend].port
-                if port:
-                    _proxy_manager.setup({model.backend: port})
-            else:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Default backend '%s' failed to start — gateway will serve cloud models only",
-                    model.backend,
-                )
+    # Register external backend URLs (lm-studio, ollama, etc.)
+    external_urls = _get_external_backend_urls()
+    for backend_name, url in external_urls.items():
+        _proxy_manager.register_external_url(backend_name, url)
 
-    # Setup proxy for cloud backends (and any already-running local ones)
-    _proxy_manager.setup(_get_backend_ports())
+    # Setup proxy for cloud backends (no local ports yet — lazy loading)
+    _proxy_manager.setup({})
+
+    # Start idle monitor
+    _backend_manager.start_idle_monitor()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    if _backend_manager:
+        _backend_manager.stop_idle_monitor()
     if _proxy_manager:
         await _proxy_manager.close()
     if _backend_manager:
@@ -93,6 +90,13 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
+    # Lazy-load: ensure model is running before routing
+    port = await _backend_manager.ensure_model(resolved_model)
+    if port is not None and port > 0:
+        model_cfg = _config.models.get(resolved_model)
+        if model_cfg:
+            _proxy_manager.on_model_loaded(resolved_model, model_cfg.backend, port)
+
     # Call through proxy
     result = await _proxy_manager.completion(resolved_model, messages, stream=stream)
 
@@ -120,23 +124,76 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             return JSONResponse(content=content)
 
 
+@app.post("/v1/embeddings", response_model=None)
+async def embeddings(request: Request) -> JSONResponse:
+    if not _config or not _proxy_manager or not _backend_manager:
+        raise HTTPException(503, "Gateway not initialized yet")
+
+    body = await request.json()
+    model = body.get("model", _config.embedding_model or _config.default_model)
+    input_text = body.get("input", "")
+
+    if model not in _config.models:
+        raise HTTPException(404, f"Unknown model: {model}")
+
+    # Lazy-load: ensure model is running
+    port = await _backend_manager.ensure_model(model)
+    if port is not None and port > 0:
+        model_cfg = _config.models.get(model)
+        if model_cfg:
+            _proxy_manager.on_model_loaded(model, model_cfg.backend, port)
+
+    # In-process embedding models — call directly, no HTTP
+    model_cfg = _config.models.get(model)
+    if model_cfg and _backend_manager._embed_manager.is_loaded(model):
+        result = _backend_manager._embed_manager.generate(model, input_text)
+        return JSONResponse(content=result)
+
+    result = await _proxy_manager.embedding(model, input_text)
+
+    if isinstance(result, httpx.Response):
+        return JSONResponse(content=result.json())
+    else:
+        content = result.model_dump() if hasattr(result, "model_dump") else result
+        return JSONResponse(content=content)
+
+
 @app.get("/v1/models")
 async def list_models() -> dict:
     models = _proxy_manager.get_available_models()
+    # Annotate with loaded status
+    for m in models:
+        alias = m["alias"]
+        if _backend_manager:
+            m["loaded"] = _backend_manager.is_model_loaded(alias)
+        else:
+            m["loaded"] = False
     return {"object": "list", "data": models}
 
 
 @app.get("/health")
 async def health() -> dict:
     statuses = _backend_manager.get_status()
+    loaded = {
+        alias: {
+            "running": s.running,
+            "port": s.port,
+            "model": s.model_alias,
+            "last_used": s.last_used,
+        }
+        for alias, s in statuses.items()
+        if s.running and (s.port is not None or s.last_used is not None)
+    }
+    available = [
+        alias for alias, s in statuses.items()
+        if alias not in loaded
+    ]
     return {
         "status": "healthy",
         "port": _config.port,
         "default_model": _config.default_model,
-        "backends": {
-            name: {"running": s.running, "port": s.port, "model": s.model_alias}
-            for name, s in statuses.items()
-        },
+        "loaded_models": loaded,
+        "available_models": available,
     }
 
 
@@ -148,20 +205,82 @@ async def get_config() -> dict:
 @app.post("/gateway/switch")
 async def switch_model(request: Request) -> dict:
     body = await request.json()
-    model_alias = body.get("model")
-    if model_alias not in _config.models:
-        raise HTTPException(404, f"Unknown model: {model_alias}")
-    model_cfg = _config.models[model_alias]
-    success = await _backend_manager.switch_model(model_cfg.backend, model_alias)
+    new_model = body.get("model")
+    old_model = body.get("old_model")
+
+    if new_model not in _config.models:
+        raise HTTPException(404, f"Unknown model: {new_model}")
+
+    if old_model and old_model in _config.models:
+        success = await _backend_manager.switch_model(old_model, new_model)
+    else:
+        port = await _backend_manager.ensure_model(new_model)
+        success = port is not None
+
     if success:
-        port = _backend_manager.get_status()[model_cfg.backend].port
-        _proxy_manager.update_backend_url(model_cfg.backend, port)
+        port = _backend_manager.get_port(new_model)
+        model_cfg = _config.models[new_model]
+        if port and port > 0:
+            _proxy_manager.on_model_loaded(new_model, model_cfg.backend, port)
+
+    return {"success": success, "model": new_model}
+
+
+@app.post("/gateway/models/load")
+async def load_model(request: Request) -> dict:
+    """Explicitly trigger model loading."""
+    if not _config or not _backend_manager or not _proxy_manager:
+        raise HTTPException(503, "Gateway not initialized yet")
+
+    body = await request.json()
+    model_alias = body.get("model")
+    if not model_alias or model_alias not in _config.models:
+        raise HTTPException(404, f"Unknown model: {model_alias}")
+
+    port = await _backend_manager.ensure_model(model_alias)
+    if port is not None and port > 0:
+        model_cfg = _config.models[model_alias]
+        _proxy_manager.on_model_loaded(model_alias, model_cfg.backend, port)
+
+    return {
+        "success": port is not None,
+        "model": model_alias,
+        "port": port,
+    }
+
+
+@app.post("/gateway/models/unload")
+async def unload_model(request: Request) -> dict:
+    """Explicitly unload a model."""
+    if not _config or not _backend_manager or not _proxy_manager:
+        raise HTTPException(503, "Gateway not initialized yet")
+
+    body = await request.json()
+    model_alias = body.get("model")
+    if not model_alias or model_alias not in _config.models:
+        raise HTTPException(404, f"Unknown model: {model_alias}")
+
+    success = _backend_manager.unload_model(model_alias)
+    if success:
+        model_cfg = _config.models[model_alias]
+        _proxy_manager.on_model_unloaded(model_alias, model_cfg.backend)
+
     return {"success": success, "model": model_alias}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_external_backend_urls() -> dict[str, str]:
+    """Get URLs for external backends (lm-studio, ollama, etc.) from config."""
+    from model_gateway.backends import _EXTERNAL_BACKENDS
+    urls: dict[str, str] = {}
+    for name, cfg in _config.backends.items():
+        if name in _EXTERNAL_BACKENDS and cfg.enabled and cfg.host:
+            urls[name] = f"{cfg.host.rstrip('/')}/v1"
+    return urls
 
 
 def _get_backend_ports() -> dict[str, int]:
@@ -178,12 +297,17 @@ def _config_to_safe_dict(config: GatewayConfig) -> dict:
     raw = {
         "port": config.port,
         "default_model": config.default_model,
+        "embedding_model": config.embedding_model,
+        "idle_timeout": config.idle_timeout,
+        "idle_check_interval": config.idle_check_interval,
         "models": {
             name: {
                 "backend": m.backend,
                 "model_id": m.model_id,
                 "model_path": m.model_path,
                 "api_key_env": m.api_key_env,
+                "pin": m.pin,
+                "idle_timeout": m.idle_timeout,
             }
             for name, m in config.models.items()
         },

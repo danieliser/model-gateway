@@ -1,7 +1,11 @@
 port: 8800
 default_model: qwen3-4b
+embedding_model: nomic-embed
 
 models:
+  nomic-embed:
+    backend: mlx
+    model_id: ~/Toolkit/models/nomicai-modernbert-embed-base-bf16
   qwen3-4b:
     backend: mlx
     model_id: mlx-community/Qwen3-4B-Instruct-4bit
@@ -27,6 +31,9 @@ backends:
   llama-cpp:
     enabled: true
     binary: llama-server
+  lm-studio:
+    enabled: true
+    host: http://localhost:1234
   ollama:
     enabled: false
     host: http://localhost:11434
