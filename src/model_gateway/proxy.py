@@ -7,7 +7,7 @@ import httpx
 import litellm
 from litellm import Router
 
-from model_gateway.config import CLOUD_BACKENDS, GatewayConfig
+from model_gateway.config import CLOUD_BACKENDS, TTS_BACKENDS, GatewayConfig
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,106 @@ class ProxyManager:
             raise RuntimeError("ProxyManager not initialized — call setup() first")
 
         return await self._router.aembedding(model=model, input=input_text)
+
+    async def audio_speech(
+        self,
+        model: str,
+        text: str,
+        voice: str = "af_heart",
+        speed: float = 1.0,
+        response_format: str = "wav",
+        **kwargs: Any,
+    ) -> bytes:
+        """Route a TTS request to cloud or external backend. Returns audio bytes."""
+        model_cfg = self._config.models.get(model)
+        if model_cfg is None:
+            raise RuntimeError(f"Unknown model: {model}")
+
+        backend = model_cfg.backend
+
+        if backend == "elevenlabs":
+            return await self._elevenlabs_tts(model_cfg, text, voice, **kwargs)
+
+        if backend == "google-tts":
+            return await self._google_tts(model_cfg, text, voice, **kwargs)
+
+        if backend == "tts-external":
+            # Passthrough to external TTS server
+            backend_cfg = self._config.backends.get(backend)
+            host = (backend_cfg.host if backend_cfg and backend_cfg.host else None)
+            if not host:
+                raise RuntimeError(f"No host configured for tts-external backend")
+            url = f"{host.rstrip('/')}/v1/audio/speech"
+            payload: dict[str, Any] = {
+                "model": model_cfg.model_id or model,
+                "input": text,
+                "voice": voice,
+                "speed": speed,
+                "response_format": response_format,
+            }
+            payload.update(kwargs)
+            if not self._http_client:
+                self._http_client = httpx.AsyncClient(timeout=120.0)
+            resp = await self._http_client.post(url, json=payload)
+            resp.raise_for_status()
+            return resp.content
+
+        raise RuntimeError(f"Unsupported TTS backend: {backend}")
+
+    async def _elevenlabs_tts(
+        self, model_cfg: Any, text: str, voice: str, **kwargs: Any
+    ) -> bytes:
+        """Call ElevenLabs TTS API."""
+        import os
+        api_key_env = model_cfg.api_key_env or (
+            self._config.backends.get("elevenlabs", None)
+            and self._config.backends["elevenlabs"].api_key_env
+        ) or "ELEVENLABS_API_KEY"
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise RuntimeError(f"ElevenLabs API key not set ({api_key_env})")
+
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+        headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+        payload = {
+            "text": text,
+            "model_id": model_cfg.model_id or "eleven_turbo_v2_5",
+        }
+        if not self._http_client:
+            self._http_client = httpx.AsyncClient(timeout=120.0)
+        resp = await self._http_client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.content
+
+    async def _google_tts(
+        self, model_cfg: Any, text: str, voice: str, **kwargs: Any
+    ) -> bytes:
+        """Call Google Cloud TTS API."""
+        import os
+        api_key_env = model_cfg.api_key_env or (
+            self._config.backends.get("google-tts", None)
+            and self._config.backends["google-tts"].api_key_env
+        ) or "GOOGLE_CLOUD_API_KEY"
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            raise RuntimeError(f"Google TTS API key not set ({api_key_env})")
+
+        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+        payload = {
+            "input": {"text": text},
+            "voice": {
+                "languageCode": kwargs.get("lang_code", "en-US"),
+                "name": voice,
+            },
+            "audioConfig": {"audioEncoding": "LINEAR16"},
+        }
+        if not self._http_client:
+            self._http_client = httpx.AsyncClient(timeout=120.0)
+        resp = await self._http_client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        import base64
+        return base64.b64decode(data["audioContent"])
 
     async def close(self) -> None:
         """Close the httpx client."""

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "model-gateway"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local model gateway with routing and backend management"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,9 @@ dependencies = [
     "fastapi",
     "httpx",
     "vllm-mlx>=0.2.1",
+    "mlx-audio>=0.2.10",
+    "soundfile",
+    "numpy",
 ]
 
 [project.scripts]

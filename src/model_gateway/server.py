@@ -9,10 +9,10 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from model_gateway.backends import BackendManager
-from model_gateway.config import CLOUD_BACKENDS, GatewayConfig, load_config, validate_config
+from model_gateway.config import CLOUD_BACKENDS, TTS_BACKENDS, GatewayConfig, load_config, validate_config
 from model_gateway.proxy import ProxyManager
 from model_gateway.routing import TaskRouter
 
@@ -48,6 +48,16 @@ async def startup() -> None:
 
     # Setup proxy for cloud backends (no local ports yet — lazy loading)
     _proxy_manager.setup({})
+
+    # Configure TTS subsystems
+    from model_gateway.normalize import configure as configure_normalize
+    from model_gateway.tts_cache import configure as configure_cache
+    configure_normalize(_config.tts.pronunciations)
+    configure_cache(
+        cache_dir=_config.tts.cache_dir,
+        max_mb=_config.tts.cache_max_mb,
+        max_age_days=_config.tts.cache_max_age_days,
+    )
 
     # Start idle monitor
     _backend_manager.start_idle_monitor()
@@ -178,6 +188,130 @@ async def embeddings(request: Request) -> JSONResponse:
     else:
         content = result.model_dump() if hasattr(result, "model_dump") else result
         return JSONResponse(content=content)
+
+
+@app.post("/v1/audio/speech", response_model=None)
+async def audio_speech(request: Request) -> Response:
+    """OpenAI-compatible TTS endpoint. Returns audio bytes."""
+    if not _config or not _backend_manager or not _proxy_manager:
+        raise HTTPException(503, "Gateway not initialized yet")
+
+    body = await request.json()
+    text = body.get("input", "")
+    if not text:
+        raise HTTPException(400, "Missing 'input' field")
+
+    model = body.get("model")
+    voice = body.get("voice", _config.tts.default_voice)
+    speed = float(body.get("speed", _config.tts.default_speed))
+    lang_code = body.get("lang_code", _config.tts.default_lang_code)
+    exaggeration = body.get("exaggeration")
+    instruct = body.get("instruct")
+    conds_path = body.get("conds_path")
+    ref_audio = body.get("ref_audio")
+    response_format = body.get("response_format", "wav")
+
+    if exaggeration is not None:
+        exaggeration = float(exaggeration)
+
+    # Resolve model — accept config alias, model_id, or filesystem path
+    if not model:
+        for alias, cfg in _config.models.items():
+            if cfg.backend in TTS_BACKENDS:
+                model = alias
+                break
+    elif model not in _config.models:
+        # Try reverse lookup by model_id (e.g. "kokoro-82m-bf16" → "kokoro")
+        for alias, cfg in _config.models.items():
+            if cfg.backend in TTS_BACKENDS and cfg.model_id == model:
+                model = alias
+                break
+        # Try matching by basename of a filesystem path
+        if model not in _config.models and "/" in model:
+            basename = model.rstrip("/").rsplit("/", 1)[-1]
+            for alias, cfg in _config.models.items():
+                if cfg.backend in TTS_BACKENDS and cfg.model_id == basename:
+                    model = alias
+                    break
+    if not model or model not in _config.models:
+        raise HTTPException(404, f"Unknown or no TTS model: {model}")
+
+    model_cfg = _config.models[model]
+    if model_cfg.backend not in TTS_BACKENDS:
+        raise HTTPException(400, f"Model '{model}' is not a TTS model (backend: {model_cfg.backend})")
+
+    # Check cache first
+    from model_gateway.tts_cache import cache_lookup, cache_store
+    model_id = model_cfg.model_id or model
+    cached = cache_lookup(text, model_id, voice, lang_code, speed)
+    if cached:
+        audio_bytes = cached.read_bytes()
+        media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
+        return Response(content=audio_bytes, media_type=media)
+
+    # Lazy-load model
+    port = await _backend_manager.ensure_model(model)
+    if port is None:
+        raise HTTPException(503, f"Failed to load TTS model: {model}")
+
+    # In-process MLX-Audio — call TtsManager directly
+    if model_cfg.backend == "mlx-audio" and _backend_manager._tts_manager.is_loaded(model):
+        # Apply text normalization
+        from model_gateway.normalize import normalize
+        normalized = normalize(text)
+
+        audio_bytes = _backend_manager._tts_manager.generate(
+            model,
+            normalized,
+            voice=voice,
+            speed=speed,
+            lang_code=lang_code,
+            exaggeration=exaggeration,
+            instruct=instruct,
+            conds_path=conds_path,
+            ref_audio=ref_audio,
+            response_format=response_format,
+        )
+
+        # Store in cache
+        cache_store(text, model_id, voice, lang_code, speed, audio_bytes)
+
+        media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
+        return Response(content=audio_bytes, media_type=media)
+
+    # Cloud or external TTS — proxy through
+    audio_bytes = await _proxy_manager.audio_speech(
+        model=model,
+        text=text,
+        voice=voice,
+        speed=speed,
+        response_format=response_format,
+        lang_code=lang_code,
+        exaggeration=exaggeration,
+        instruct=instruct,
+        conds_path=conds_path,
+        ref_audio=ref_audio,
+    )
+
+    # Store in cache
+    cache_store(text, model_id, voice, lang_code, speed, audio_bytes)
+
+    media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
+    return Response(content=audio_bytes, media_type=media)
+
+
+@app.get("/v1/audio/cache/stats")
+async def audio_cache_stats() -> dict:
+    """Return TTS cache statistics."""
+    from model_gateway.tts_cache import cache_stats
+    return cache_stats()
+
+
+@app.post("/v1/audio/cache/prune")
+async def audio_cache_prune() -> dict:
+    """Run TTS cache eviction."""
+    from model_gateway.tts_cache import cache_prune
+    return cache_prune()
 
 
 @app.get("/v1/models")
@@ -344,6 +478,14 @@ def _config_to_safe_dict(config: GatewayConfig) -> dict:
         },
         "task_routing": config.task_routing,
         "fallback_chain": config.fallback_chain,
+        "tts": {
+            "pronunciations": config.tts.pronunciations,
+            "cache_dir": config.tts.cache_dir,
+            "cache_max_mb": config.tts.cache_max_mb,
+            "default_voice": config.tts.default_voice,
+            "default_lang_code": config.tts.default_lang_code,
+            "default_speed": config.tts.default_speed,
+        },
     }
     return _redact_api_keys(raw)
 

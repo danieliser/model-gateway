@@ -766,6 +766,60 @@ def health(ctx):
             click.echo(f"  {mark} {name}{detail}")
 
 
+@cli.command()
+@click.argument("text")
+@click.option("--model", "-m", default=None, help="TTS model alias (default: first TTS model in config)")
+@click.option("--voice", default=None, help="Voice ID (default: from config)")
+@click.option("--speed", type=float, default=None, help="Speed multiplier (default: 1.0)")
+@click.option("--output", "-o", default=None, help="Save to file instead of playing")
+@click.pass_context
+def speak(ctx, text, model, voice, speed, output):
+    """Generate and play TTS audio."""
+    config = _load_config_or_exit()
+
+    payload = {"input": text, "response_format": "wav"}
+    if model:
+        payload["model"] = model
+    if voice:
+        payload["voice"] = voice
+    if speed:
+        payload["speed"] = speed
+
+    url = f"http://localhost:{config.port}/v1/audio/speech"
+    try:
+        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp.raise_for_status()
+        data = resp.content
+    except httpx.ConnectError:
+        raise click.ClickException("Gateway not running. Start with: model-gateway start")
+    except httpx.HTTPStatusError as e:
+        raise click.ClickException(f"TTS request failed: {e.response.text}")
+
+    if output:
+        with open(output, "wb") as f:
+            f.write(data)
+        click.echo(f"Saved to {output}")
+    else:
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="tts-cli-")
+        tmp.write(data)
+        tmp.close()
+        try:
+            import subprocess as sp
+            sp.run(["play", "-q", tmp.name], check=False, timeout=30)
+        except FileNotFoundError:
+            try:
+                sp.run(["afplay", tmp.name], check=False, timeout=30)
+            except FileNotFoundError:
+                click.echo(f"Audio saved to {tmp.name} (no player found)")
+                return
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Worker lifecycle
 # ---------------------------------------------------------------------------

@@ -1,0 +1,94 @@
+port: 8800
+default_model: qwen3-4b
+embedding_model: nomic-embed
+
+models:
+  nomic-embed:
+    backend: mlx-embed
+    model_id: ~/Toolkit/models/nomicai-modernbert-embed-base-bf16
+  qwen3-4b:
+    backend: mlx
+    model_id: mlx-community/Qwen3-4B-Instruct-4bit
+  qwen3-8b:
+    backend: mlx
+    model_id: mlx-community/Qwen3-8B-Instruct-4bit
+  glm-4.7-flash:
+    backend: lm-studio
+    model_id: zai-org/glm-4.7-flash
+  glm-4.6v-flash:
+    backend: lm-studio
+    model_id: zai-org/glm-4.6v-flash
+  haiku:
+    backend: anthropic
+    model_id: claude-haiku-4-5-20251001
+    api_key_env: ANTHROPIC_API_KEY
+  sonnet:
+    backend: anthropic
+    model_id: claude-sonnet-4-6
+    api_key_env: ANTHROPIC_API_KEY
+  gpt-4o:
+    backend: openai
+    model_id: gpt-4o
+    api_key_env: OPENAI_API_KEY
+
+  kokoro:
+    backend: mlx-audio
+    model_id: kokoro-82m-bf16
+    idle_timeout: 600
+
+  chatterbox:
+    backend: mlx-audio
+    model_id: chatterbox-turbo-fp16
+    idle_timeout: 300
+
+backends:
+  mlx:
+    enabled: true
+  mlx-embed:
+    enabled: true
+  llama-cpp:
+    enabled: true
+    binary: llama-server
+  lm-studio:
+    enabled: true
+    host: http://localhost:1234
+  ollama:
+    enabled: false
+    host: http://localhost:11434
+  anthropic:
+    enabled: true
+    api_key_env: ANTHROPIC_API_KEY
+  openai:
+    enabled: true
+    api_key_env: OPENAI_API_KEY
+  mlx-audio:
+    enabled: true
+  elevenlabs:
+    enabled: false
+    api_key_env: ELEVENLABS_API_KEY
+  google-tts:
+    enabled: false
+    api_key_env: GOOGLE_CLOUD_API_KEY
+
+tts:
+  pronunciations: ~/Toolkit/voice/pronunciations.yml
+  cache_dir: ~/Toolkit/cache/tts
+  default_voice: af_heart
+  default_lang_code: a
+  default_speed: 1.0
+
+task_routing:
+  extraction: qwen3-4b
+  classification: qwen3-4b
+  coding: sonnet
+  reasoning: opus
+  general: haiku
+  agent-voice: kokoro
+  expressive-tts: chatterbox
+
+fallback_chain:
+  - mlx
+  - llama-cpp
+  - ollama
+  - anthropic
+

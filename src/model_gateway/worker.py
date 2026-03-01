@@ -136,6 +136,39 @@ class Worker:
         )
         await writer.drain()
 
+    async def handle_tts(self, req: dict, writer: asyncio.StreamWriter) -> None:
+        """Generate TTS audio via the gateway's /v1/audio/speech endpoint."""
+        url = f"http://localhost:{self._config.port}/v1/audio/speech"
+
+        payload = {
+            "model": req.get("model"),
+            "input": req["text"],
+            "voice": req.get("voice"),
+            "speed": req.get("speed", 1.0),
+            "response_format": req.get("response_format", "wav"),
+        }
+        # Pass through optional params
+        for key in ("lang_code", "exaggeration", "instruct", "conds_path", "ref_audio"):
+            if key in req:
+                payload[key] = req[key]
+
+        t0 = time.perf_counter()
+        resp = await self._client.post(url, json=payload)
+        resp.raise_for_status()
+        latency = (time.perf_counter() - t0) * 1000
+
+        # Save to temp file and return the path
+        import tempfile
+        suffix = ".mp3" if req.get("response_format") == "mp3" else ".wav"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False, prefix="tts-worker-")
+        tmp.write(resp.content)
+        tmp.close()
+
+        writer.write(
+            (json.dumps({"path": tmp.name, "done": True, "latency_ms": round(latency)}) + "\n").encode()
+        )
+        await writer.drain()
+
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -153,6 +186,8 @@ class Worker:
                 await self.handle_embed(req, writer)
             elif req_type == "complete":
                 await self.handle_complete(req, writer)
+            elif req_type == "tts":
+                await self.handle_tts(req, writer)
             elif req_type == "ping":
                 uptime = time.monotonic() - self._start_time
                 writer.write(

@@ -26,6 +26,17 @@ class BackendConfig:
 
 
 @dataclass
+class TtsConfig:
+    pronunciations: str | None = None
+    cache_dir: str | None = None
+    cache_max_mb: int = 500
+    cache_max_age_days: int = 30
+    default_voice: str = "af_heart"
+    default_lang_code: str = "a"
+    default_speed: float = 1.0
+
+
+@dataclass
 class GatewayConfig:
     port: int = 8800
     default_model: str | None = None
@@ -36,6 +47,7 @@ class GatewayConfig:
     backends: dict[str, BackendConfig] = field(default_factory=dict)
     task_routing: dict[str, str] = field(default_factory=dict)
     fallback_chain: list[str] = field(default_factory=list)
+    tts: TtsConfig = field(default_factory=TtsConfig)
 
 
 def load_config(path: str | None = None) -> GatewayConfig:
@@ -88,6 +100,18 @@ def _parse_config(path: Path) -> GatewayConfig:
         for name, cfg in (data.get("backends") or {}).items()
     }
 
+    # Parse TTS config
+    tts_data = data.get("tts") or {}
+    tts_config = TtsConfig(
+        pronunciations=tts_data.get("pronunciations"),
+        cache_dir=tts_data.get("cache_dir"),
+        cache_max_mb=tts_data.get("cache_max_mb", 500),
+        cache_max_age_days=tts_data.get("cache_max_age_days", 30),
+        default_voice=tts_data.get("default_voice", "af_heart"),
+        default_lang_code=tts_data.get("default_lang_code", "a"),
+        default_speed=float(tts_data.get("default_speed", 1.0)),
+    )
+
     return GatewayConfig(
         port=data.get("port", 8800),
         default_model=data.get("default_model"),
@@ -98,10 +122,12 @@ def _parse_config(path: Path) -> GatewayConfig:
         backends=backends,
         task_routing=data.get("task_routing") or {},
         fallback_chain=data.get("fallback_chain") or [],
+        tts=tts_config,
     )
 
 
-CLOUD_BACKENDS = {"anthropic", "openai"}
+CLOUD_BACKENDS = {"anthropic", "openai", "elevenlabs", "google-tts"}
+TTS_BACKENDS = {"mlx-audio", "elevenlabs", "google-tts", "tts-external"}
 
 
 def validate_config(config: GatewayConfig) -> list[str]:
@@ -127,7 +153,7 @@ def validate_config(config: GatewayConfig) -> list[str]:
             errors.append(
                 f"model '{model_name}' references unknown backend '{model.backend}'"
             )
-        if model.backend not in CLOUD_BACKENDS:
+        if model.backend not in CLOUD_BACKENDS and model.backend != "tts-external":
             if not model.model_id and not model.model_path:
                 errors.append(
                     f"model '{model_name}' uses local backend '{model.backend}' "
