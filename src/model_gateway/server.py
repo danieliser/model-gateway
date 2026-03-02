@@ -243,7 +243,7 @@ async def audio_speech(request: Request) -> Response:
     # Check cache first
     from model_gateway.tts_cache import cache_lookup, cache_store
     model_id = model_cfg.model_id or model
-    cached = cache_lookup(text, model_id, voice, lang_code, speed)
+    cached = cache_lookup(text, model_id, voice, lang_code, speed, conds_path)
     if cached:
         audio_bytes = cached.read_bytes()
         media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
@@ -274,7 +274,7 @@ async def audio_speech(request: Request) -> Response:
         )
 
         # Store in cache
-        cache_store(text, model_id, voice, lang_code, speed, audio_bytes)
+        cache_store(text, model_id, voice, lang_code, speed, audio_bytes, conds_path=conds_path)
 
         media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
         return Response(content=audio_bytes, media_type=media)
@@ -294,7 +294,7 @@ async def audio_speech(request: Request) -> Response:
     )
 
     # Store in cache
-    cache_store(text, model_id, voice, lang_code, speed, audio_bytes)
+    cache_store(text, model_id, voice, lang_code, speed, audio_bytes, conds_path=conds_path)
 
     media = "audio/mpeg" if response_format == "mp3" else "audio/wav"
     return Response(content=audio_bytes, media_type=media)

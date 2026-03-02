@@ -178,7 +178,9 @@ class TtsManager:
         if instruct:
             gen_kwargs["instruct"] = instruct
         if conds_path:
-            gen_kwargs["conds_path"] = conds_path
+            conds_obj = self._load_conds(conds_path)
+            if conds_obj is not None:
+                gen_kwargs["conds"] = conds_obj
         if ref_audio:
             gen_kwargs["ref_audio"] = ref_audio
 
@@ -216,6 +218,66 @@ class TtsManager:
             wav_bytes = self._wav_to_mp3(wav_bytes)
 
         return wav_bytes
+
+    @staticmethod
+    def _load_conds(path: str) -> Any | None:
+        """Load a .safetensors or .conds file into a Chatterbox Conditionals object.
+
+        Supports two formats:
+        - .safetensors: flat dict with t3.*/gen.* prefixed keys (preferred)
+        - .conds: pickle dict with t3 (T3Cond) and gen (dict) keys (legacy)
+        """
+        try:
+            import mlx.core as mx
+            from mlx_audio.tts.models.chatterbox.chatterbox import Conditionals, T3Cond
+
+            expanded = os.path.expanduser(path)
+            if not os.path.isfile(expanded):
+                logger.warning("conds_path not found: %s", expanded)
+                return None
+
+            # Legacy pickle format (.conds) — local user-generated files only
+            if expanded.endswith(".conds"):
+                import pickle  # noqa: S403 — trusted local files
+                with open(expanded, "rb") as f:
+                    raw = pickle.load(f)  # noqa: S301
+                t3_obj = raw["t3"]
+                t3_cond = T3Cond(
+                    speaker_emb=t3_obj.speaker_emb,
+                    cond_prompt_speech_tokens=t3_obj.cond_prompt_speech_tokens,
+                    emotion_adv=getattr(t3_obj, "emotion_adv", None) or mx.ones((1, 1, 1)) * 0.5,
+                )
+                return Conditionals(t3_cond, raw["gen"])
+
+            conds_data = mx.load(expanded)
+
+            speaker_emb = conds_data.get("t3.speaker_emb")
+            if speaker_emb is None:
+                speaker_emb = mx.zeros((1, 256))
+
+            cond_tokens = conds_data.get("t3.cond_prompt_speech_tokens")
+            emotion_adv = conds_data.get("t3.emotion_adv")
+            if emotion_adv is None:
+                emotion_adv = mx.ones((1, 1, 1)) * 0.5
+
+            t3_cond = T3Cond(
+                speaker_emb=speaker_emb,
+                cond_prompt_speech_tokens=cond_tokens,
+                emotion_adv=emotion_adv,
+            )
+
+            gen_dict = {}
+            for k, v in conds_data.items():
+                if k.startswith("gen."):
+                    gen_dict[k.replace("gen.", "")] = v
+
+            if "prompt_feat_len" not in gen_dict and "prompt_feat" in gen_dict:
+                gen_dict["prompt_feat_len"] = mx.array([gen_dict["prompt_feat"].shape[1]])
+
+            return Conditionals(t3_cond, gen_dict)
+        except Exception:
+            logger.exception("Failed to load conds from %s", path)
+            return None
 
     @staticmethod
     def _wav_to_mp3(wav_bytes: bytes) -> bytes:

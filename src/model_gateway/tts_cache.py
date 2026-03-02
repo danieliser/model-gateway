@@ -33,12 +33,15 @@ def configure(
     _cache_max_age_days = max_age_days
 
 
-def _cache_key(text: str, model_id: str, voice: str, lang_code: str, speed: float) -> str:
+def _cache_key(
+    text: str, model_id: str, voice: str, lang_code: str, speed: float,
+    conds_path: str | None = None,
+) -> str:
     """Deterministic hash for a set of TTS parameters."""
-    payload = json.dumps(
-        {"text": text, "model_id": model_id, "voice": voice, "lang_code": lang_code, "speed": speed},
-        sort_keys=True,
-    )
+    params: dict = {"text": text, "model_id": model_id, "voice": voice, "lang_code": lang_code, "speed": speed}
+    if conds_path:
+        params["conds_path"] = conds_path
+    payload = json.dumps(params, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -57,10 +60,11 @@ def _save_index(index: dict) -> None:
 
 
 def cache_lookup(
-    text: str, model_id: str, voice: str, lang_code: str, speed: float
+    text: str, model_id: str, voice: str, lang_code: str, speed: float,
+    conds_path: str | None = None,
 ) -> Path | None:
     """Return cached audio path if it exists, otherwise None."""
-    key = _cache_key(text, model_id, voice, lang_code, speed)
+    key = _cache_key(text, model_id, voice, lang_code, speed, conds_path)
     index = _load_index()
     entry = index.get(key)
     if not entry:
@@ -86,10 +90,11 @@ def cache_store(
     speed: float,
     audio_bytes: bytes,
     duration_ms: float = 0,
+    conds_path: str | None = None,
 ) -> Path:
     """Store audio bytes in cache. Returns the cache file path."""
     _cache_dir.mkdir(parents=True, exist_ok=True)
-    key = _cache_key(text, model_id, voice, lang_code, speed)
+    key = _cache_key(text, model_id, voice, lang_code, speed, conds_path)
     path = _cache_dir / f"{key}.wav"
     path.write_bytes(audio_bytes)
 
