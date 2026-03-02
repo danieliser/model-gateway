@@ -177,10 +177,19 @@ class TtsManager:
             gen_kwargs["exaggeration"] = exaggeration
         if instruct:
             gen_kwargs["instruct"] = instruct
+        prev_conds = None  # For restoring after turbo-style models
         if conds_path:
             conds_obj = self._load_conds(conds_path)
             if conds_obj is not None:
-                gen_kwargs["conds"] = conds_obj
+                # chatterbox_turbo doesn't accept 'conds' kwarg — only reads self._conds.
+                # Non-turbo chatterbox accepts it as a generate() parameter.
+                import inspect
+                gen_sig = inspect.signature(info.model.generate)
+                if "conds" in gen_sig.parameters:
+                    gen_kwargs["conds"] = conds_obj
+                elif hasattr(info.model, "_conds"):
+                    prev_conds = info.model._conds
+                    info.model._conds = conds_obj
         if ref_audio:
             gen_kwargs["ref_audio"] = ref_audio
 
@@ -190,14 +199,18 @@ class TtsManager:
         audio_chunks = []
         sample_rate = 24000
 
-        for result in info.model.generate(text, **gen_kwargs):
-            if hasattr(result, "audio"):
-                audio_chunks.append(np.array(result.audio))
-                if hasattr(result, "sample_rate") and result.sample_rate:
-                    sample_rate = result.sample_rate
-            else:
-                # Raw array fallback
-                audio_chunks.append(np.array(result))
+        try:
+            for result in info.model.generate(text, **gen_kwargs):
+                if hasattr(result, "audio"):
+                    audio_chunks.append(np.array(result.audio))
+                    if hasattr(result, "sample_rate") and result.sample_rate:
+                        sample_rate = result.sample_rate
+                else:
+                    # Raw array fallback
+                    audio_chunks.append(np.array(result))
+        finally:
+            if prev_conds is not None:
+                info.model._conds = prev_conds
 
         if not audio_chunks:
             raise RuntimeError("No audio generated")
