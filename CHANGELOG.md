@@ -2,6 +2,17 @@
 
 All notable changes to model-gateway will be documented in this file.
 
+## [0.4.0] - 2026-03-03
+
+### Added
+- **Reranking backend (`mlx-rerank`)** — In-process cross-encoder reranking via sentence-transformers
+- **`POST /v1/rerank`** — Cohere-compatible reranking endpoint (query + documents → sorted relevance scores)
+- **RerankManager** — Model lifecycle (lazy load, idle timeout, unload) matching EmbedManager/TtsManager pattern
+- **`rerank_model` config field** — Per-type default model for reranking, independent of embeddings
+- **`--type rerank`** on CLI switch command
+- **Default model** — `jinaai/jina-reranker-v2-base-multilingual` (278M params, multilingual)
+- **`sentence-transformers`** dependency for CrossEncoder inference
+
 ## [0.3.0] - 2026-03-01
 
 ### Added

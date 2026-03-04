@@ -10,7 +10,6 @@ import click
 import httpx
 
 from model_gateway.config import (
-    CLOUD_BACKENDS,
     get_config_dir,
     get_log_dir,
     get_pid_file,
@@ -105,12 +104,8 @@ def _resolve_api_base(config, model_alias: str) -> tuple[str, str]:
             f"Unknown model '{model_alias}'. Available: {', '.join(available)}"
         )
 
-    if model_cfg.backend in CLOUD_BACKENDS:
-        return f"http://localhost:{config.port}/v1", model_alias
-
-    # Local backend — go direct
-    model_id = model_cfg.model_id or model_alias
-    return "http://localhost:8801/v1", model_id
+    # All backends go through the gateway (in-process backends have no port)
+    return f"http://localhost:{config.port}/v1", model_alias
 
 
 def _get_prompt_or_stdin(prompt: str | None) -> str:
@@ -252,7 +247,7 @@ def embed(text, model, input_file):
     import json as _json
 
     config = _load_config_or_exit()
-    model = model or _default_model(config)
+    model = model or config.embedding_model or _default_model(config)
 
     if input_file:
         with open(input_file) as f:
@@ -545,7 +540,7 @@ def models(ctx):
         click.secho(str(e), fg="red", err=True)
         raise SystemExit(1)
 
-    data = _gateway_request("GET", "/models", port=config.port)
+    data = _gateway_request("GET", "/v1/models", port=config.port)
 
     if data is None:
         # Fall back to static config display
@@ -555,13 +550,14 @@ def models(ctx):
             click.echo(f"{alias:<15} {m.backend:<12} {model_id:<40} (gateway offline)")
         return
 
+    entries = data.get("data", data) if isinstance(data, dict) else data
     click.echo(f"{'ALIAS':<15} {'BACKEND':<12} {'MODEL':<40} STATUS")
-    for entry in data:
+    for entry in entries:
         alias = entry.get("alias", "")
         backend = entry.get("backend", "")
-        model_id = entry.get("model", "")
-        ok = entry.get("available", False)
-        status_str = click.style("✓ ready", fg="green") if ok else click.style("✗ unavailable", fg="red")
+        model_id = entry.get("model_id", entry.get("model", ""))
+        loaded = entry.get("loaded", False)
+        status_str = click.style("● loaded", fg="green") if loaded else click.style("○ idle", fg="yellow")
         click.echo(f"{alias:<15} {backend:<12} {model_id:<40} {status_str}")
 
 
@@ -571,23 +567,39 @@ def models(ctx):
 
 @cli.command()
 @click.argument("alias")
+@click.option("--type", "-t", "model_type", default=None,
+              type=click.Choice(["chat", "embed", "rerank", "tts"]),
+              help="Set as default for a specific type (chat, embed, rerank, tts).")
 @click.pass_context
-def switch(ctx, alias):
-    """Switch the default model to ALIAS."""
+def switch(ctx, alias, model_type):
+    """Switch the default model to ALIAS.
+
+    \b
+    Without --type, sets the global default_model.
+    With --type, sets the type-specific default:
+      gateway switch kokoro --type tts
+      gateway switch nomic-embed --type embed
+      gateway switch qwen3-8b --type chat
+    """
     try:
         config = load_config()
     except FileNotFoundError as e:
         click.secho(str(e), fg="red", err=True)
         raise SystemExit(1)
 
-    result = _gateway_request("POST", "/gateway/switch", port=config.port, json={"model": alias})
+    payload = {"model": alias}
+    if model_type:
+        payload["model_type"] = model_type
+
+    result = _gateway_request("POST", "/gateway/switch", port=config.port, json=payload)
     if result is None:
         click.secho(
             "Gateway not running. Run 'model-gateway start' first.", fg="red", err=True
         )
         raise SystemExit(1)
 
-    click.secho(f"Switched to model: {alias}", fg="green")
+    label = model_type or "default"
+    click.secho(f"Switched {label} model to: {alias}", fg="green")
 
 
 @cli.command()

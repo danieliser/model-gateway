@@ -41,6 +41,8 @@ class GatewayConfig:
     port: int = 8800
     default_model: str | None = None
     embedding_model: str | None = None
+    rerank_model: str | None = None
+    tts_model: str | None = None
     idle_timeout: int = 900
     idle_check_interval: int = 30
     models: dict[str, ModelConfig] = field(default_factory=dict)
@@ -116,6 +118,8 @@ def _parse_config(path: Path) -> GatewayConfig:
         port=data.get("port", 8800),
         default_model=data.get("default_model"),
         embedding_model=data.get("embedding_model"),
+        rerank_model=data.get("rerank_model"),
+        tts_model=data.get("tts_model"),
         idle_timeout=data.get("idle_timeout", 900),
         idle_check_interval=data.get("idle_check_interval", 30),
         models=models,
@@ -128,6 +132,7 @@ def _parse_config(path: Path) -> GatewayConfig:
 
 CLOUD_BACKENDS = {"anthropic", "openai", "elevenlabs", "google-tts"}
 TTS_BACKENDS = {"mlx-audio", "elevenlabs", "google-tts", "tts-external"}
+RERANK_BACKENDS = {"mlx-rerank"}
 
 
 def validate_config(config: GatewayConfig) -> list[str]:
@@ -146,6 +151,14 @@ def validate_config(config: GatewayConfig) -> list[str]:
     if config.default_model and config.default_model not in config.models:
         errors.append(
             f"default_model '{config.default_model}' not found in models"
+        )
+    if config.rerank_model and config.rerank_model not in config.models:
+        errors.append(
+            f"rerank_model '{config.rerank_model}' not found in models"
+        )
+    if config.tts_model and config.tts_model not in config.models:
+        errors.append(
+            f"tts_model '{config.tts_model}' not found in models"
         )
 
     for model_name, model in config.models.items():

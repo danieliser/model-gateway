@@ -16,11 +16,12 @@ import httpx
 from model_gateway.config import CLOUD_BACKENDS, TTS_BACKENDS, BackendConfig, GatewayConfig, ModelConfig, get_log_dir
 from model_gateway.embed_server import EmbedManager
 from model_gateway.llm_server import LlmManager
+from model_gateway.rerank_server import RerankManager
 from model_gateway.tts_server import TtsManager
 
 logger = logging.getLogger(__name__)
 _EXTERNAL_BACKENDS = {"ollama", "lm_studio", "lm-studio", "tts-external"}
-_IN_PROCESS_BACKENDS = {"mlx-embed", "mlx", "mlx-audio"}
+_IN_PROCESS_BACKENDS = {"mlx-embed", "mlx", "mlx-audio", "mlx-rerank"}
 
 
 def _find_vllm_mlx() -> str | None:
@@ -80,6 +81,7 @@ class BackendManager:
         self._idle_monitor_task: asyncio.Task | None = None
         self._embed_manager = EmbedManager()
         self._llm_manager = LlmManager()
+        self._rerank_manager = RerankManager()
         self._tts_manager = TtsManager()
 
     def _alloc_port(self) -> int:
@@ -206,6 +208,8 @@ class BackendManager:
         if backend_name in _IN_PROCESS_BACKENDS:
             if backend_name == "mlx-embed":
                 manager = self._embed_manager
+            elif backend_name == "mlx-rerank":
+                manager = self._rerank_manager
             elif backend_name == "mlx-audio":
                 manager = self._tts_manager
             else:  # "mlx"
@@ -349,6 +353,8 @@ class BackendManager:
         if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
             if model_cfg.backend == "mlx-embed":
                 return self._embed_manager.unload(model_alias)
+            if model_cfg.backend == "mlx-rerank":
+                return self._rerank_manager.unload(model_alias)
             if model_cfg.backend == "mlx-audio":
                 return self._tts_manager.unload(model_alias)
             # "mlx" — schedule async unload, return True optimistically
@@ -373,6 +379,8 @@ class BackendManager:
         if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
             if model_cfg.backend == "mlx-embed":
                 return self._embed_manager.unload(model_alias)
+            if model_cfg.backend == "mlx-rerank":
+                return self._rerank_manager.unload(model_alias)
             if model_cfg.backend == "mlx-audio":
                 return self._tts_manager.unload(model_alias)
             return await self._llm_manager.unload(model_alias)
@@ -537,6 +545,8 @@ class BackendManager:
             # Pick the right manager
             if model_cfg.backend == "mlx-embed":
                 manager = self._embed_manager
+            elif model_cfg.backend == "mlx-rerank":
+                manager = self._rerank_manager
             elif model_cfg.backend == "mlx-audio":
                 manager = self._tts_manager
             else:
@@ -581,6 +591,8 @@ class BackendManager:
                 continue
             if model_cfg.backend == "mlx-embed":
                 manager = self._embed_manager
+            elif model_cfg.backend == "mlx-rerank":
+                manager = self._rerank_manager
             elif model_cfg.backend == "mlx-audio":
                 manager = self._tts_manager
             else:
@@ -633,11 +645,17 @@ class BackendManager:
         if model_cfg and model_cfg.backend in _IN_PROCESS_BACKENDS:
             if model_cfg.backend == "mlx-embed":
                 return self._embed_manager.is_loaded(model_alias)
+            if model_cfg.backend == "mlx-rerank":
+                return self._rerank_manager.is_loaded(model_alias)
             if model_cfg.backend == "mlx-audio":
                 return self._tts_manager.is_loaded(model_alias)
             return self._llm_manager.is_loaded(model_alias)
         if model_cfg and model_cfg.backend in CLOUD_BACKENDS:
             return True
+        # External backends (lm-studio, ollama) — check if enabled with host
+        if model_cfg and model_cfg.backend in _EXTERNAL_BACKENDS:
+            cfg = self._config.backends.get(model_cfg.backend)
+            return cfg is not None and cfg.enabled and bool(cfg.host)
         return False
 
     def get_backend_name(self, model_alias: str) -> str | None:
@@ -659,6 +677,10 @@ class BackendManager:
         for alias, cfg in self._config.models.items():
             if cfg.backend == "mlx-embed" and self._embed_manager.is_loaded(alias):
                 self._embed_manager.unload(alias)
+        # Unload in-process rerankers
+        for alias, cfg in self._config.models.items():
+            if cfg.backend == "mlx-rerank" and self._rerank_manager.is_loaded(alias):
+                self._rerank_manager.unload(alias)
         # Unload in-process TTS models
         for alias, cfg in self._config.models.items():
             if cfg.backend == "mlx-audio" and self._tts_manager.is_loaded(alias):

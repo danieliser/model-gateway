@@ -1,6 +1,8 @@
 port: 8800
 default_model: qwen3-4b
 embedding_model: nomic-embed
+rerank_model: jina-reranker  # Default reranker model (optional)
+tts_model: kokoro            # Default TTS model (optional)
 
 models:
   nomic-embed:
@@ -24,6 +26,10 @@ models:
     backend: openai
     model_id: gpt-4o
     api_key_env: OPENAI_API_KEY
+  jina-reranker:
+    backend: mlx-rerank
+    model_id: jinaai/jina-reranker-v2-base-multilingual
+    idle_timeout: 600
 
 backends:
   mlx:
@@ -45,6 +51,8 @@ backends:
   openai:
     enabled: true
     api_key_env: OPENAI_API_KEY
+  mlx-rerank:
+    enabled: true
 
 task_routing:
   extraction: qwen3-4b

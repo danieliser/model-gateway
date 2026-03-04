@@ -12,13 +12,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from model_gateway.backends import BackendManager
-from model_gateway.config import CLOUD_BACKENDS, TTS_BACKENDS, GatewayConfig, load_config, validate_config
+from model_gateway.config import CLOUD_BACKENDS, RERANK_BACKENDS, TTS_BACKENDS, GatewayConfig, load_config, validate_config
 from model_gateway.proxy import ProxyManager
 from model_gateway.routing import TaskRouter
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Model Gateway", version="0.2.0")
+app = FastAPI(title="Model Gateway", version="0.4.0")
 
 # Global state (initialized on startup)
 _config: GatewayConfig | None = None
@@ -190,6 +190,51 @@ async def embeddings(request: Request) -> JSONResponse:
         return JSONResponse(content=content)
 
 
+@app.post("/v1/rerank", response_model=None)
+async def rerank(request: Request) -> JSONResponse:
+    """Cohere-compatible reranking endpoint."""
+    if not _config or not _backend_manager:
+        raise HTTPException(503, "Gateway not initialized yet")
+
+    body = await request.json()
+    model = body.get("model", _config.rerank_model)
+    query = body.get("query", "")
+    documents = body.get("documents", [])
+    top_n = body.get("top_n")
+
+    if not query:
+        raise HTTPException(400, "Missing 'query' field")
+    if not documents:
+        raise HTTPException(400, "Missing 'documents' field")
+
+    # Resolve model — accept alias or scan for first rerank backend
+    if not model:
+        for alias, cfg in _config.models.items():
+            if cfg.backend in RERANK_BACKENDS:
+                model = alias
+                break
+    if not model or model not in _config.models:
+        raise HTTPException(404, f"Unknown or no reranker model: {model}")
+
+    model_cfg = _config.models[model]
+    if model_cfg.backend not in RERANK_BACKENDS:
+        raise HTTPException(400, f"Model '{model}' is not a reranker (backend: {model_cfg.backend})")
+
+    # Lazy-load model
+    port = await _backend_manager.ensure_model(model)
+    if port is None:
+        raise HTTPException(503, f"Failed to load reranker model: {model}")
+
+    # In-process reranking
+    if _backend_manager._rerank_manager.is_loaded(model):
+        result = _backend_manager._rerank_manager.rerank(
+            model, query, documents, top_n=top_n,
+        )
+        return JSONResponse(content=result)
+
+    raise HTTPException(503, f"Reranker model '{model}' not available")
+
+
 @app.post("/v1/audio/speech", response_model=None)
 async def audio_speech(request: Request) -> Response:
     """OpenAI-compatible TTS endpoint. Returns audio bytes."""
@@ -216,10 +261,14 @@ async def audio_speech(request: Request) -> Response:
 
     # Resolve model — accept config alias, model_id, or filesystem path
     if not model:
-        for alias, cfg in _config.models.items():
-            if cfg.backend in TTS_BACKENDS:
-                model = alias
-                break
+        # Prefer explicit tts_model, then scan for first TTS backend
+        if _config.tts_model and _config.tts_model in _config.models:
+            model = _config.tts_model
+        else:
+            for alias, cfg in _config.models.items():
+                if cfg.backend in TTS_BACKENDS:
+                    model = alias
+                    break
     elif model not in _config.models:
         # Try reverse lookup by model_id (e.g. "kokoro-82m-bf16" → "kokoro")
         for alias, cfg in _config.models.items():
@@ -348,6 +397,9 @@ async def health() -> dict:
         "status": "healthy",
         "port": _config.port,
         "default_model": _config.default_model,
+        "embedding_model": _config.embedding_model,
+        "rerank_model": _config.rerank_model,
+        "tts_model": _config.tts_model,
         "loaded_models": loaded,
         "available_models": available,
     }
@@ -363,6 +415,7 @@ async def switch_model(request: Request) -> dict:
     body = await request.json()
     new_model = body.get("model")
     old_model = body.get("old_model")
+    model_type = body.get("model_type")  # "chat", "embed", "tts", or None
 
     if new_model not in _config.models:
         raise HTTPException(404, f"Unknown model: {new_model}")
@@ -379,7 +432,19 @@ async def switch_model(request: Request) -> dict:
         if port and port > 0:
             _proxy_manager.on_model_loaded(new_model, model_cfg.backend, port)
 
-    return {"success": success, "model": new_model}
+        # Update the runtime default for the specified type
+        if model_type == "embed":
+            _config.embedding_model = new_model
+        elif model_type == "rerank":
+            _config.rerank_model = new_model
+        elif model_type == "tts":
+            _config.tts_model = new_model
+        elif model_type == "chat":
+            _config.default_model = new_model
+        elif model_type is None:
+            _config.default_model = new_model
+
+    return {"success": success, "model": new_model, "type": model_type or "default"}
 
 
 @app.post("/gateway/models/load")
@@ -454,6 +519,7 @@ def _config_to_safe_dict(config: GatewayConfig) -> dict:
         "port": config.port,
         "default_model": config.default_model,
         "embedding_model": config.embedding_model,
+        "rerank_model": config.rerank_model,
         "idle_timeout": config.idle_timeout,
         "idle_check_interval": config.idle_check_interval,
         "models": {
